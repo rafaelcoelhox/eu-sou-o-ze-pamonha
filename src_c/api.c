@@ -721,23 +721,32 @@ static void handle_conn(Conn *c, int efd) {
     }
 }
 
-static int register_client_fd(int fd, int efd) {
+static Conn *register_client_fd(int fd, int efd) {
+#ifndef RINHA_ASSUME_PASSED_FD_FLAGS
     set_fd_nonblock_cloexec(fd);
+#endif
 
-    Conn *nc=conn_alloc();
-    if (!nc){close(fd);return -1;}
+    Conn *nc = conn_alloc();
+    if (!nc) {
+        close(fd);
+        return NULL;
+    }
 
-    nc->fd=fd; nc->head=nc->tail=0;
-    struct epoll_event ev={
-        .events=EPOLLIN|EPOLLRDHUP|EPOLLET,
-        .data.ptr=nc
+    nc->fd = fd;
+    nc->head = nc->tail = 0;
+
+    struct epoll_event ev = {
+        .events = EPOLLIN | EPOLLRDHUP | EPOLLET,
+        .data.ptr = nc
     };
-    if (epoll_ctl(efd,EPOLL_CTL_ADD,fd,&ev) < 0) {
+
+    if (epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ev) < 0) {
         close(fd);
         conn_release(nc);
-        return -1;
+        return NULL;
     }
-    return 0;
+
+    return nc;
 }
 
 static int recv_one_passed_fd(int sock) {
@@ -780,16 +789,29 @@ static int recv_one_passed_fd(int sock) {
 
 static int drain_control_fds(CtrlConn *cc, int efd) {
     for (;;) {
-        int fd=recv_one_passed_fd(cc->fd);
-        if (fd == -2) return 0;
-        if (fd < 0) return -1;
-        if (register_client_fd(fd,efd) < 0) {
-            /* register_client_fd already closes fd on failure */
+        int fd = recv_one_passed_fd(cc->fd);
+
+        if (fd == -2) {
+            return 0;
+        }
+
+        if (fd < 0) {
+            return -1;
+        }
+
+        Conn *nc = register_client_fd(fd, efd);
+
+        if (!nc) {
             continue;
         }
+        /*
+         * Tenta processar imediatamente o socket recém-passado pelo LB.
+         * Se ainda não houver dados, handle_conn sai em EAGAIN/EWOULDBLOCK
+         * e o FD continua registrado no epoll.
+         */
+        handle_conn(nc, efd);
     }
 }
-
 static void accept_control_loop(int ctrl_sfd, int efd) {
     for (;;) {
         int fd=accept4(ctrl_sfd,NULL,NULL,SOCK_NONBLOCK|SOCK_CLOEXEC);
