@@ -1,0 +1,16 @@
+{
+  "participants": ["Rafael Coelho"],
+  "social": ["https://github.com/rafaelcoelhox"],
+  "source-code-repo": "https://github.com/rafaelcoelhox/eu-sou-o-ze-pamonha",
+  "stack": [
+    "c",
+    "gcc",
+    "avx2",
+    "ivf-kmeans",
+    "scm-rights",
+    "fd-handoff",
+    "unix-socket",
+    "epoll"
+  ],
+  "open_to_work": true
+}

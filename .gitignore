@@ -1,0 +1,26 @@
+# Local config
+.env
+.env.local
+
+# Build artifacts
+*.o
+*.a
+build/
+submission-build/
+
+# IVF index (built at image build time)
+*.ivf
+data/
+
+# Python tooling
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

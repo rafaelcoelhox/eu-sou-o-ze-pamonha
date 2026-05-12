@@ -1,0 +1,63 @@
+services:
+  canjica: &api
+    image: ${RINHA_IMAGE:-ghcr.io/rafaelcoelhox/eu-sou-o-ze-pamonha:latest}
+    command: ["/usr/local/bin/canjica"]
+    environment:
+      RINHA_SOCK: /run/sock/canjica.sock
+      RINHA_INDEX_PATH: /app/data/index.ivf
+    volumes:
+      - sock:/run/sock
+    networks:
+      - rinha
+    deploy:
+      resources:
+        limits:
+          cpus: "0.42"
+          memory: "160MB"
+    cpus: "0.42"
+    mem_limit: 160m
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+  pamonha:
+    <<: *api
+    command: ["/usr/local/bin/pamonha"]
+    environment:
+      RINHA_SOCK: /run/sock/pamonha.sock
+      RINHA_INDEX_PATH: /app/data/index.ivf
+
+  lb:
+    image: ${RINHA_IMAGE:-ghcr.io/rafaelcoelhox/eu-sou-o-ze-pamonha:latest}
+    command: ["/usr/local/bin/carro-da-pamonha"]
+    depends_on:
+      - canjica
+      - pamonha
+    environment:
+      RINHA_LB_PORT: "9999"
+      RINHA_UPSTREAMS: /run/sock/canjica.sock,/run/sock/pamonha.sock
+    ports:
+      - "9999:9999"
+    volumes:
+      - sock:/run/sock
+    networks:
+      - rinha
+    deploy:
+      resources:
+        limits:
+          cpus: "0.16"
+          memory: "30MB"
+    cpus: "0.16"
+    mem_limit: 30m
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+networks:
+  rinha:
+    driver: bridge
+
+volumes:
+  sock:
