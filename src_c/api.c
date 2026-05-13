@@ -748,7 +748,6 @@ static Conn *register_client_fd(int fd, int efd) {
 
     return nc;
 }
-
 static int recv_one_passed_fd(int sock) {
     char byte;
     struct iovec iov={.iov_base=&byte,.iov_len=1};
@@ -802,17 +801,18 @@ static int drain_control_fds(CtrlConn *cc, int efd) {
         Conn *nc = register_client_fd(fd, efd);
 
         if (!nc) {
+            /*
+             * register_client_fd already closes fd on failure.
+             */
             continue;
         }
+
         /*
-         * Tenta processar imediatamente o socket recém-passado pelo LB.
-         * Se ainda não houver dados, handle_conn sai em EAGAIN/EWOULDBLOCK
-         * e o FD continua registrado no epoll.
+         * Não processa imediatamente.
+         * Deixa o epoll acordar quando o socket do cliente estiver pronto.
          */
-        handle_conn(nc, efd);
     }
-}
-static void accept_control_loop(int ctrl_sfd, int efd) {
+}static void accept_control_loop(int ctrl_sfd, int efd) {
     for (;;) {
         int fd=accept4(ctrl_sfd,NULL,NULL,SOCK_NONBLOCK|SOCK_CLOEXEC);
         if (fd<0) {

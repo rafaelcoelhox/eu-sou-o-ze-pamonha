@@ -66,12 +66,7 @@ static int set_cloexec(int fd) {
  */
 static void set_tcp_opts(int fd) {
     int one = 1;
-
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-
-#ifdef TCP_QUICKACK
-    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
-#endif
 }
 
 static int ends_with(const char *s, const char *suffix) {
