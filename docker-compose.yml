@@ -1,6 +1,6 @@
 services:
   canjica: &api
-    image: ${RINHA_IMAGE:-ghcr.io/rafaelcoelhox/eu-sou-o-ze-pamonha:rc1}
+    image: ${RINHA_IMAGE:-ghcr.io/rafaelcoelhox/eu-sou-o-ze-pamonha:rc2}
     command: ["/usr/local/bin/canjica"]
     environment:
       RINHA_SOCK: /run/sock/canjica.sock
@@ -12,9 +12,9 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
+          cpus: "0.42"
           memory: "160MB"
-    cpus: "0.40"
+    cpus: "0.42"
     mem_limit: 160m
     ulimits:
       nofile:
@@ -29,7 +29,7 @@ services:
       RINHA_INDEX_PATH: /app/data/index.ivf
 
   lb:
-    image: ${RINHA_IMAGE:-ghcr.io/rafaelcoelhox/eu-sou-o-ze-pamonha:rc1}
+    image: ${RINHA_IMAGE:-ghcr.io/rafaelcoelhox/eu-sou-o-ze-pamonha:rc2}
     command: ["/usr/local/bin/carro-da-pamonha"]
     depends_on:
       - canjica
@@ -46,9 +46,9 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.20"
+          cpus: "0.16"
           memory: "30MB"
-    cpus: "0.20"
+    cpus: "0.16"
     mem_limit: 30m
     ulimits:
       nofile:
