@@ -808,11 +808,15 @@ static int drain_control_fds(CtrlConn *cc, int efd) {
         }
 
         /*
-         * Não processa imediatamente.
-         * Deixa o epoll acordar quando o socket do cliente estiver pronto.
+         * Base rc1: tenta processar imediatamente o FD recebido.
+         * Se ainda não houver dados, handle_conn sai em EAGAIN/EWOULDBLOCK
+         * e o FD continua registrado no epoll.
          */
+        handle_conn(nc, efd);
     }
-}static void accept_control_loop(int ctrl_sfd, int efd) {
+}
+
+static void accept_control_loop(int ctrl_sfd, int efd) {
     for (;;) {
         int fd=accept4(ctrl_sfd,NULL,NULL,SOCK_NONBLOCK|SOCK_CLOEXEC);
         if (fd<0) {

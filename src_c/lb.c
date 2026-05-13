@@ -21,6 +21,8 @@
 #define MAX_EVENTS 64
 #define BACKLOG 65535
 #define UNIX_PATH_MAX 108
+#define DEFAULT_LB_WORKERS 2
+#define MAX_LB_WORKERS 4
 
 typedef struct {
     char path[UNIX_PATH_MAX];
@@ -57,12 +59,10 @@ static int set_cloexec(int fd) {
 }
 
 /*
- * Mantém TCP_NODELAY.
- * Remove TCP_QUICKACK do hot path.
+ * Mantém TCP_NODELAY e deixa TCP_QUICKACK fora.
  *
- * Motivo:
- * - TCP_QUICKACK era uma syscall por conexão aceita.
- * - Como a API responde muito rápido, vale testar sem esse custo.
+ * rc3 mostrou que restaurar TCP_QUICKACK não ajudou no oficial.
+ * Este rc mantém a base do rc1 e testa apenas multi-worker no accept.
  */
 static void set_tcp_opts(int fd) {
     int one = 1;
@@ -287,6 +287,13 @@ static int handoff_client_fd(int idx, int cfd) {
     return send_fd_once(upstreams[idx].fd, cfd);
 }
 
+/*
+ * Cada worker chama listen_tcp().
+ *
+ * Isso é proposital: para SO_REUSEPORT distribuir accept entre processos,
+ * cada worker precisa criar/bindar/listen no próprio socket.
+ * Não crie o listener antes do fork.
+ */
 static int listen_tcp(int port) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 
@@ -374,19 +381,15 @@ static void accept_loop(int sfd) {
     }
 }
 
-int main(void) {
-    signal(SIGPIPE, SIG_IGN);
+static void run_worker(int worker_id, int port) {
+    /*
+     * Cada processo tem suas próprias conexões de controle e seu próprio rr_next.
+     * O seed alternado evita que todos os workers comecem mandando para a mesma API.
+     */
+    rr_next = (uint32_t)worker_id;
 
     parse_upstreams();
     connect_all_upstreams();
-
-    int port = 9999;
-
-    const char *port_env = getenv("RINHA_LB_PORT");
-
-    if (port_env && *port_env) {
-        port = atoi(port_env);
-    }
 
     int sfd = listen_tcp(port);
 
@@ -428,4 +431,52 @@ int main(void) {
             }
         }
     }
+}
+
+static int read_int_env(const char *name, int fallback, int minv, int maxv) {
+    const char *env = getenv(name);
+
+    if (!env || !*env) {
+        return fallback;
+    }
+
+    int v = atoi(env);
+
+    if (v < minv) {
+        v = minv;
+    }
+
+    if (v > maxv) {
+        v = maxv;
+    }
+
+    return v;
+}
+
+int main(void) {
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);
+
+    int port = read_int_env("RINHA_LB_PORT", 9999, 1, 65535);
+    int workers = read_int_env("RINHA_LB_WORKERS", DEFAULT_LB_WORKERS, 1, MAX_LB_WORKERS);
+
+    /*
+     * Fork antes de criar listener/control sockets.
+     * Assim cada worker cria seu próprio listener SO_REUSEPORT.
+     */
+    for (int i = 1; i < workers; i++) {
+        pid_t pid = fork();
+
+        if (pid < 0) {
+            die("fork");
+        }
+
+        if (pid == 0) {
+            run_worker(i, port);
+            return 0;
+        }
+    }
+
+    run_worker(0, port);
+    return 0;
 }
