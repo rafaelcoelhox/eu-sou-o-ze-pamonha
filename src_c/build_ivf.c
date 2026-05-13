@@ -23,6 +23,7 @@ static const char MAGIC[8] = {'C','I','V','F','2',0,0,0};
 typedef struct __attribute__((packed)) {
     char     magic[8];
     uint32_t n, k, d, total_blocks, padded_n;
+    uint8_t  _pad[4];
 } IndexHeader;
 
 static uint64_t g_rng;

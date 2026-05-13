@@ -21,8 +21,7 @@
 #define DIMS         14
 #define BLOCK_VECS   16
 #define VECTOR_SCALE 0.0001f   
-#define FAST_NPROBE  8
-#define FULL_NPROBE  24       
+#define FULL_NPROBE  20
 
 #define MAX_CONNS   512
 #define RX_BUF_SZ  8192
@@ -61,6 +60,7 @@ static float mcc_risk(uint32_t mcc) {
 typedef struct __attribute__((packed)) {
     char     magic[8];
     uint32_t n, k, d, total_blocks, padded_n;
+    uint8_t  _pad[4];
 } IvfHeader;
 
 static const float    *g_ct;
@@ -69,7 +69,7 @@ static const uint8_t  *g_labels;
 static const int16_t  *g_blocks;
 static int             g_k;
 
-static float g_dists[4096];
+static float g_dists[4096] __attribute__((aligned(32)));
 
 static void load_index(const char *path) {
     int fd = open(path, O_RDONLY);
@@ -332,10 +332,10 @@ static void compute_centroid_dists(const float *q, const float *ct, int k, float
         __m256 qd = _mm256_set1_ps(q[0]);
         int ci;
         for (ci=0; ci+16<=k; ci+=16) {
-            __m256 d0=_mm256_sub_ps(_mm256_loadu_ps(cp+ci),   qd);
-            __m256 d1=_mm256_sub_ps(_mm256_loadu_ps(cp+ci+8), qd);
-            _mm256_storeu_ps(dists+ci,   _mm256_mul_ps(d0,d0));
-            _mm256_storeu_ps(dists+ci+8, _mm256_mul_ps(d1,d1));
+            __m256 d0=_mm256_sub_ps(_mm256_load_ps(cp+ci),   qd);
+            __m256 d1=_mm256_sub_ps(_mm256_load_ps(cp+ci+8), qd);
+            _mm256_store_ps(dists+ci,   _mm256_mul_ps(d0,d0));
+            _mm256_store_ps(dists+ci+8, _mm256_mul_ps(d1,d1));
         }
         for (; ci<k; ci++) { float d=cp[ci]-q[0]; dists[ci]=d*d; }
     }
@@ -344,11 +344,11 @@ static void compute_centroid_dists(const float *q, const float *ct, int k, float
         __m256 qd = _mm256_set1_ps(q[d]);
         int ci;
         for (ci=0; ci+16<=k; ci+=16) {
-            __m256 cv0=_mm256_loadu_ps(cp+ci);   __m256 cv1=_mm256_loadu_ps(cp+ci+8);
+            __m256 cv0=_mm256_load_ps(cp+ci);   __m256 cv1=_mm256_load_ps(cp+ci+8);
             __m256 d0 =_mm256_sub_ps(cv0,qd);    __m256 d1 =_mm256_sub_ps(cv1,qd);
-            __m256 a0 =_mm256_loadu_ps(dists+ci);__m256 a1 =_mm256_loadu_ps(dists+ci+8);
-            _mm256_storeu_ps(dists+ci,   _mm256_fmadd_ps(d0,d0,a0));
-            _mm256_storeu_ps(dists+ci+8, _mm256_fmadd_ps(d1,d1,a1));
+            __m256 a0 =_mm256_load_ps(dists+ci);__m256 a1 =_mm256_load_ps(dists+ci+8);
+            _mm256_store_ps(dists+ci,   _mm256_fmadd_ps(d0,d0,a0));
+            _mm256_store_ps(dists+ci+8, _mm256_fmadd_ps(d1,d1,a1));
         }
         for (; ci<k; ci++) { float dd=cp[ci]-q[d]; dists[ci]+=dd*dd; }
     }
@@ -470,21 +470,13 @@ static uint8_t knn5_search(const float *q) {
     uint8_t top5l[5]={0};
     int wi=0;
 
-    for (int pi=0; pi<FAST_NPROBE; pi++) {
+    for (int pi=0; pi<FULL_NPROBE; pi++) {
         int ci=probes[pi];
         scan_cluster(qv, g_offsets[ci], g_offsets[ci+1], top5d, top5l, &wi);
     }
+
     uint8_t fc=0;
     for (int i=0;i<5;i++) fc+=top5l[i];
-
-        if (fc>=1 && fc<=4) {
-        for (int pi=FAST_NPROBE; pi<FULL_NPROBE; pi++) {
-            int ci=probes[pi];
-            scan_cluster(qv, g_offsets[ci], g_offsets[ci+1], top5d, top5l, &wi);
-        }
-        fc=0;
-        for (int i=0;i<5;i++) fc+=top5l[i];
-    }
     return fc;
 }
 
@@ -921,7 +913,7 @@ int main(void) {
         float dq[DIMS]={0};
         compute_centroid_dists(dq, g_ct, g_k, g_dists);
         uint32_t s = 0x9E3779B9u;
-        for (int i=0;i<2000;i++) {
+        for (int i=0;i<500;i++) {
             float q[DIMS];
             for (int d=0;d<DIMS;d++) {
                 s = s*1664525u + 1013904223u;
