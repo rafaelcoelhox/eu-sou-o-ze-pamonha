@@ -36,6 +36,7 @@ services:
       - pamonha
     environment:
       RINHA_LB_PORT: "9999"
+      RINHA_LB_WORKERS: "2"
       RINHA_UPSTREAMS: /run/sock/canjica.sock,/run/sock/pamonha.sock
     ports:
       - "9999:9999"
