@@ -1,4 +1,3 @@
-
 #define _GNU_SOURCE
 
 #include <arpa/inet.h>
@@ -430,4 +429,3 @@ int main(void) {
         }
     }
 }
-
