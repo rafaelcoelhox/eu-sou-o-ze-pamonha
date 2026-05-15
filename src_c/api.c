@@ -21,7 +21,7 @@
 #define DIMS         14
 #define BLOCK_VECS   16
 #define VECTOR_SCALE 0.0001f   
-#define FAST_NPROBE  8
+#define FAST_NPROBE  5 
 #define FULL_NPROBE  24       
 
 #define MAX_CONNS   512
@@ -477,7 +477,7 @@ static uint8_t knn5_search(const float *q) {
     uint8_t fc=0;
     for (int i=0;i<5;i++) fc+=top5l[i];
 
-        if (fc>=1 && fc<=4) {
+        if (fc>=2 && fc<=3) {
         for (int pi=FAST_NPROBE; pi<FULL_NPROBE; pi++) {
             int ci=probes[pi];
             scan_cluster(qv, g_offsets[ci], g_offsets[ci+1], top5d, top5l, &wi);
