@@ -908,6 +908,7 @@ static void event_loop(int ctrl_sfd, int efd) {
     }
 }
 
+#ifndef RINHA_API_NO_MAIN
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     for (int i=0;i<6;i++) RESP_FRAUD_LEN[i]=strlen(RESP_FRAUD[i]);
@@ -953,3 +954,4 @@ int main(void) {
     event_loop(ctrl_sfd,efd);
     return 0;
 }
+#endif

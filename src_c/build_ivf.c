@@ -354,6 +354,7 @@ static void write_ivf(const char *path, const float *centroids, int k, const uin
     free(cvecs); free(csz); free(ccap);
 }
 
+#ifndef RINHA_BUILD_IVF_NO_MAIN
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <references.json.gz> <output.ivf> [N_CLUSTERS]\n", argv[0]);
@@ -385,3 +386,4 @@ int main(int argc, char **argv) {
     free(g_vecs); free(g_lbls);
     return 0;
 }
+#endif

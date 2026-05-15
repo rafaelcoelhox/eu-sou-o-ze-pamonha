@@ -12,14 +12,16 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
           memory: "160MB"
-    cpus: "0.45"
+    cpu_period: 10000
+    cpu_quota: 4500
     mem_limit: 160m
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
+    security_opt:
+      - seccomp:unconfined
   pamonha:
     <<: *api
     command: ["/usr/local/bin/pamonha"]
@@ -44,14 +46,16 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
           memory: "30MB"
-    cpus: "0.10"
+    cpu_period: 10000
+    cpu_quota: 1000
     mem_limit: 30m
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
+    security_opt:
+      - seccomp:unconfined
 networks:
   rinha:
     driver: bridge

@@ -6,7 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc libc-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY src_c ./src_c
+RUN mkdir -p src_c
+COPY src_c/api.c src_c/build_ivf.c src_c/lb.c ./src_c/
 COPY resources ./resources
 
 RUN gcc -O3 -march=haswell -mavx2 -mfma -pthread \

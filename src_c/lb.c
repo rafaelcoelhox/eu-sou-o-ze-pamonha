@@ -374,6 +374,7 @@ static void accept_loop(int sfd) {
     }
 }
 
+#ifndef RINHA_LB_NO_MAIN
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
 
@@ -429,3 +430,4 @@ int main(void) {
         }
     }
 }
+#endif
