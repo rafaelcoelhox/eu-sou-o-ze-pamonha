@@ -20,9 +20,9 @@
 
 #define DIMS         14
 #define BLOCK_VECS   16
-#define VECTOR_SCALE 0.0001f   
-#define FAST_NPROBE  5 
-#define FULL_NPROBE  24       
+#define VECTOR_SCALE 0.0001f
+#define FAST_NPROBE  5
+#define FULL_NPROBE  24
 
 #define MAX_CONNS   512
 #define RX_BUF_SZ  8192
@@ -37,7 +37,7 @@ static const char *RESP_FRAUD[6] = {
     R_HDR "36\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}",
     R_HDR "36\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}",
 };
-static size_t RESP_FRAUD_LEN[6]; 
+static size_t RESP_FRAUD_LEN[6];
 static const char RESP_READY[]    = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
 static const char RESP_NOT_FOUND[]= "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static const char RESP_BAD_REQ[]  = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -369,8 +369,8 @@ static void top_n(const float *dists, int k, int n, int *out) {
 }
 
 static void scan_cluster(
-    const __m256 *qv,          
-    uint32_t bs, uint32_t be,  
+    const __m256 *qv,
+    uint32_t bs, uint32_t be,
     float top5d[5], uint8_t top5l[5], int *wi)
 {
     __m256 scale = _mm256_set1_ps(VECTOR_SCALE);
@@ -477,7 +477,7 @@ static uint8_t knn5_search(const float *q) {
     uint8_t fc=0;
     for (int i=0;i<5;i++) fc+=top5l[i];
 
-        if (fc>=2 && fc<=3) {
+    if (fc>=1 && fc<=4) {
         for (int pi=FAST_NPROBE; pi<FULL_NPROBE; pi++) {
             int ci=probes[pi];
             scan_cluster(qv, g_offsets[ci], g_offsets[ci+1], top5d, top5l, &wi);
@@ -917,7 +917,7 @@ int main(void) {
 
     load_index(ipath);
 
-        {
+    {
         float dq[DIMS]={0};
         compute_centroid_dists(dq, g_ct, g_k, g_dists);
         uint32_t s = 0x9E3779B9u;
