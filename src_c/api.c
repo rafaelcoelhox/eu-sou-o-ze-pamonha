@@ -28,6 +28,8 @@
 #define RX_BUF_SZ  8192
 #define MAX_IOVECS   16
 
+/* Canned HTTP responses --------------------------------------------------- */
+
 #define R_HDR "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
 static const char *RESP_FRAUD[6] = {
     R_HDR "35\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}",
@@ -41,6 +43,8 @@ static size_t RESP_FRAUD_LEN[6];
 static const char RESP_READY[]    = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
 static const char RESP_NOT_FOUND[]= "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static const char RESP_BAD_REQ[]  = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/* Feature lookup tables --------------------------------------------------- */
 
 static float mcc_risk(uint32_t mcc) {
     switch (mcc) {
@@ -57,6 +61,8 @@ static float mcc_risk(uint32_t mcc) {
         default:   return 0.50f;
     }
 }
+
+/* IVF index mapping ------------------------------------------------------- */
 
 typedef struct __attribute__((packed)) {
     char     magic[8];
@@ -113,6 +119,8 @@ static void load_index(const char *path) {
     #undef ALIGN_UP32
 }
 
+/* Date/time helpers ------------------------------------------------------- */
+
 static uint8_t day_of_week(uint16_t y, uint8_t m, uint8_t d) {
     static const uint8_t T[12] = {0,3,2,5,0,3,5,1,4,6,2,4};
     uint32_t ya = (m < 3) ? (uint32_t)(y-1) : (uint32_t)y;
@@ -139,6 +147,8 @@ static uint32_t minutes_between(
     int64_t diff = b - a;
     return (uint32_t)(diff < 0 ? 0 : diff);
 }
+
+/* Payload parsing --------------------------------------------------------- */
 
 typedef struct {
     float    amount, customer_avg, merchant_avg, km_home, km_current;
@@ -302,6 +312,8 @@ static int parse_json(const char *buf, int len, Payload *px) {
     return 1;
 }
 
+/* Payload vectorization --------------------------------------------------- */
+
 static inline float round4(float x) { return roundf(x*10000.f)*0.0001f; }
 static inline float clamp01(float x) {
     if (x<0.f) x=0.f; else if (x>1.f) x=1.f;
@@ -330,6 +342,8 @@ static void vectorize(const Payload *px, float *v) {
     v[12] = mcc_risk(px->mcc);
     v[13] = clamp01(px->merchant_avg / 10000.f);
 }
+
+/* IVF/KNN search ---------------------------------------------------------- */
 
 static void compute_centroid_dists(const float *q, const float *ct, int k, float *dists) {
     {
@@ -518,6 +532,8 @@ static uint8_t knn5_search(const float *q) {
     return fc;
 }
 
+/* Request scoring --------------------------------------------------------- */
+
 static const char *process_fraud(const char *body, int len) {
     Payload px;
     if (!parse_json(body, len, &px)) return RESP_FRAUD[0];
@@ -526,6 +542,8 @@ static const char *process_fraud(const char *body, int len) {
     uint8_t fc = knn5_search(q);
     return RESP_FRAUD[fc < 6 ? fc : 5];
 }
+
+/* Epoll event and connection state --------------------------------------- */
 
 typedef enum {
     EV_CTRL_LISTENER = 1,
@@ -552,12 +570,14 @@ typedef struct CtrlConn {
 #define MAX_CTRL_CONNS 16
 
 static Conn      conn_pool[MAX_CONNS];
-static int       free_stk[MAX_CONNS];
-static int       free_top;
+static int       conn_free_stk[MAX_CONNS];
+static int       conn_free_top;
 static CtrlConn  ctrl_pool[MAX_CTRL_CONNS];
 static int       ctrl_free_stk[MAX_CTRL_CONNS];
 static int       ctrl_free_top;
 static EventTag  ctrl_listener_tag = { EV_CTRL_LISTENER };
+
+/* File descriptor setup --------------------------------------------------- */
 
 static int set_fd_nonblock_cloexec(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
@@ -567,23 +587,25 @@ static int set_fd_nonblock_cloexec(int fd) {
     return 0;
 }
 
+/* Connection pools -------------------------------------------------------- */
+
 static void conn_pool_init(void) {
-    free_top = MAX_CONNS;
+    conn_free_top = MAX_CONNS;
     for (int i=0;i<MAX_CONNS;i++){
         conn_pool[i].kind=EV_CLIENT;
         conn_pool[i].fd=-1;
-        free_stk[i]=i;
+        conn_free_stk[i]=i;
     }
 }
 static Conn *conn_alloc(void) {
-    if (!free_top) return NULL;
-    Conn *c = &conn_pool[free_stk[--free_top]];
+    if (!conn_free_top) return NULL;
+    Conn *c = &conn_pool[conn_free_stk[--conn_free_top]];
     c->kind = EV_CLIENT;
     return c;
 }
 static void conn_release(Conn *c) {
     c->fd=-1; c->head=c->tail=0;
-    free_stk[free_top++]=(int)(c-conn_pool);
+    conn_free_stk[conn_free_top++]=(int)(c-conn_pool);
 }
 static void conn_close(Conn *c, int efd) {
     if (c->fd >= 0) {
@@ -615,6 +637,8 @@ static void ctrl_close(CtrlConn *c, int efd) {
     c->fd=-1;
     ctrl_free_stk[ctrl_free_top++]=(int)(c-ctrl_pool);
 }
+
+/* HTTP request handling --------------------------------------------------- */
 
 static int parse_content_length(const char *buf, int hlen) {
     const char *key="content-length:";
@@ -675,6 +699,7 @@ static int handle_req(const char *buf, int len, struct iovec *iov) {
     return -1;
 }
 
+/* Client IO --------------------------------------------------------------- */
 
 static int send_iov_all(int fd, struct iovec *iov, int niov) {
     while (niov > 0) {
@@ -778,6 +803,9 @@ static Conn *register_client_fd(int fd, int efd) {
 
     return nc;
 }
+
+/* Control socket FD intake ----------------------------------------------- */
+
 static int recv_one_passed_fd(int sock) {
     char byte;
     struct iovec iov={.iov_base=&byte,.iov_len=1};
@@ -838,6 +866,8 @@ static int drain_control_fds(CtrlConn *cc, int efd) {
     }
 }
 
+/* Unix control listener --------------------------------------------------- */
+
 static void accept_control_loop(int ctrl_sfd, int efd) {
     for (;;) {
         int fd=accept4(ctrl_sfd,NULL,NULL,SOCK_NONBLOCK|SOCK_CLOEXEC);
@@ -894,6 +924,8 @@ static int listen_unix_seqpacket(const char *path) {
     return fd;
 }
 
+/* Main event loop --------------------------------------------------------- */
+
 static void event_loop(int ctrl_sfd, int efd) {
     struct epoll_event evs[128];
     for (;;) {
@@ -931,6 +963,9 @@ static void event_loop(int ctrl_sfd, int efd) {
 }
 
 #ifndef RINHA_API_NO_MAIN
+
+/* Runtime setup ----------------------------------------------------------- */
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     for (int i=0;i<6;i++) RESP_FRAUD_LEN[i]=strlen(RESP_FRAUD[i]);

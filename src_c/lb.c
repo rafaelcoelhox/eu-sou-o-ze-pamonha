@@ -22,6 +22,8 @@
 #define BACKLOG 65535
 #define UNIX_PATH_MAX 108
 
+/* Upstream control sockets ------------------------------------------------ */
+
 typedef struct {
     char path[UNIX_PATH_MAX];
     int fd;
@@ -30,7 +32,9 @@ typedef struct {
 static Upstream upstreams[MAX_UPSTREAMS];
 static int upstream_count;
 static uint32_t rr_next;
-static int efd;
+static int epoll_fd;
+
+/* Small utilities --------------------------------------------------------- */
 
 static void die(const char *msg) {
     perror(msg);
@@ -56,7 +60,7 @@ static int set_cloexec(int fd) {
     return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
-static void set_tcp_opts(int fd) {
+static void set_client_tcp_opts(int fd) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
@@ -67,6 +71,8 @@ static int ends_with(const char *s, const char *suffix) {
 
     return n >= m && memcmp(s + n - m, suffix, m) == 0;
 }
+
+/* Upstream configuration -------------------------------------------------- */
 
 static void add_upstream_path(const char *raw) {
     if (upstream_count >= MAX_UPSTREAMS) {
@@ -151,6 +157,8 @@ static void parse_upstreams(void) {
     }
 }
 
+/* Upstream connections ---------------------------------------------------- */
+
 static int connect_ctrl_once(const char *path) {
     int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
 
@@ -214,6 +222,8 @@ static int reconnect_upstream(int idx) {
     upstreams[idx].fd = fd;
     return 0;
 }
+
+/* FD passing -------------------------------------------------------------- */
 
 static int send_fd_once(int ctrl_fd, int pass_fd) {
     char byte = 'F';
@@ -279,6 +289,8 @@ static int handoff_client_fd(int idx, int cfd) {
     return send_fd_once(upstreams[idx].fd, cfd);
 }
 
+/* TCP listener ------------------------------------------------------------ */
+
 static int listen_tcp(int port) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 
@@ -312,7 +324,7 @@ static int listen_tcp(int port) {
 }
 
 static inline int next_upstream_idx(void) {
-        if (__builtin_expect(upstream_count == 2, 1)) {
+    if (__builtin_expect(upstream_count == 2, 1)) {
         int idx = (int)(rr_next & 1u);
         rr_next ^= 1u;
         return idx;
@@ -340,7 +352,7 @@ static void accept_loop(int sfd) {
             return;
         }
 
-        set_tcp_opts(cfd);
+        set_client_tcp_opts(cfd);
 
         int idx = next_upstream_idx();
 
@@ -363,6 +375,9 @@ static void accept_loop(int sfd) {
 }
 
 #ifndef RINHA_LB_NO_MAIN
+
+/* Entry point ------------------------------------------------------------- */
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
 
@@ -383,9 +398,9 @@ int main(void) {
         die("listen tcp");
     }
 
-    efd = epoll_create1(EPOLL_CLOEXEC);
+    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
 
-    if (efd < 0) {
+    if (epoll_fd < 0) {
         die("epoll_create1");
     }
 
@@ -394,14 +409,14 @@ int main(void) {
         .data.fd = sfd
     };
 
-    if (epoll_ctl(efd, EPOLL_CTL_ADD, sfd, &ev) < 0) {
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sfd, &ev) < 0) {
         die("epoll_ctl listen");
     }
 
     struct epoll_event evs[MAX_EVENTS];
 
     for (;;) {
-        int n = epoll_wait(efd, evs, MAX_EVENTS, -1);
+        int n = epoll_wait(epoll_fd, evs, MAX_EVENTS, -1);
 
         if (n < 0) {
             if (errno == EINTR) {
