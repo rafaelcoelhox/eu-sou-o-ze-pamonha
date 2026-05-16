@@ -12,10 +12,8 @@ services:
     deploy:
       resources:
         limits:
+          cpus: "0.45"
           memory: "160MB"
-    cpu_period: 10000
-    cpu_quota: 4500
-    mem_limit: 160m
     ulimits:
       nofile:
         soft: 65535
@@ -46,10 +44,8 @@ services:
     deploy:
       resources:
         limits:
+          cpus: "0.10"
           memory: "30MB"
-    cpu_period: 10000
-    cpu_quota: 1000
-    mem_limit: 30m
     ulimits:
       nofile:
         soft: 65535
