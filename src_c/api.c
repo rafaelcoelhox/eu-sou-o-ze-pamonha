@@ -100,11 +100,6 @@ static void load_index(const char *path) {
     }
     g_k = (int)hdr->k;
 
-    /*
-     * Cada seção começa em offset múltiplo de 32 — o writer (build_ivf) injeta
-     * padding entre elas. Permite _mm256_load_ps em g_ct e _mm_load_si128 nos
-     * blocos sem split-load penalty.
-     */
     #define ALIGN_UP32(x) (((x) + 31u) & ~(size_t)31u)
     size_t off = sizeof(IvfHeader);
     off = ALIGN_UP32(off);
@@ -510,14 +505,6 @@ static uint8_t knn5_search(const float *q) {
     }
     uint8_t fc=0;
     for (int i=0;i<5;i++) fc+=top5l[i];
-
-    /*
-     * Fronteira aprovado/reprovado: 2 → score 0.4 (aprovado), 3 → 0.6 (reprovado).
-     * Refinamos fc∈{2,3} pra reduzir FN (fraude aprovada) e fc=4 pra reduzir FP
-     * (legítima bloqueada — fast deu fc=4/5 mas refinement pode descer pra ≤2).
-     * fc=5 raríssimo em legítima; deixamos fora pra não pagar full em ~25k fraudes
-     * "óbvias". fc∈{0,1} também fora — refinaria FN, mas hoje FN=0.
-     */
     if (fc>=2 && fc<=4) {
         int probes_full[FULL_NPROBE];
         top_n(g_dists, g_k, FULL_NPROBE, probes_full);
@@ -844,17 +831,9 @@ static int drain_control_fds(CtrlConn *cc, int efd) {
         Conn *nc = register_client_fd(fd, efd);
 
         if (!nc) {
-            /*
-             * register_client_fd already closes fd on failure.
-             */
             continue;
         }
 
-        /*
-         * Base rc1: tenta processar imediatamente o FD recebido.
-         * Se ainda não houver dados, handle_conn sai em EAGAIN/EWOULDBLOCK
-         * e o FD continua registrado no epoll.
-         */
         handle_conn(nc, efd);
     }
 }

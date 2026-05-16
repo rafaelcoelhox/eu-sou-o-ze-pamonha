@@ -342,10 +342,6 @@ static void write_ivf(const char *path, const float *centroids, int k, const uin
     hdr.n = (uint32_t)n; hdr.k = (uint32_t)k;
     hdr.d = DIMS; hdr.total_blocks = total_blocks; hdr.padded_n = padded_n;
 
-    /*
-     * Pad cada seção pra começar em offset múltiplo de 32. O leitor (api.c)
-     * conta com isso pra emitir _mm256_load_ps em vez de loadu_ps.
-     */
     static const unsigned char zeros[32] = {0};
     #define WRITE_PAD32() do { \
         long pos = ftell(f); \

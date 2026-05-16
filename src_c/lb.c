@@ -56,14 +56,6 @@ static int set_cloexec(int fd) {
     return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
-/*
- * Mantém TCP_NODELAY.
- * Remove TCP_QUICKACK do hot path.
- *
- * Motivo:
- * - TCP_QUICKACK era uma syscall por conexão aceita.
- * - Como a API responde muito rápido, vale testar sem esse custo.
- */
 static void set_tcp_opts(int fd) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -320,11 +312,7 @@ static int listen_tcp(int port) {
 }
 
 static inline int next_upstream_idx(void) {
-    /*
-     * Fast path para a submissão oficial: 2 APIs.
-     * Evita divisão/modulo no hot path.
-     */
-    if (__builtin_expect(upstream_count == 2, 1)) {
+        if (__builtin_expect(upstream_count == 2, 1)) {
         int idx = (int)(rr_next & 1u);
         rr_next ^= 1u;
         return idx;
