@@ -18,12 +18,16 @@
 #define QUANT_SCALE   10000.0f 
 #define MAX_THREADS   16
 
+/* Index format ------------------------------------------------------------ */
+
 static const char MAGIC[8] = {'C','I','V','F','3',0,0,0};
 
 typedef struct __attribute__((packed)) {
     char     magic[8];
     uint32_t n, k, d, total_blocks, padded_n;
 } IndexHeader;
+
+/* Deterministic RNG ------------------------------------------------------- */
 
 static uint64_t g_rng;
 
@@ -36,6 +40,8 @@ static double rng_f64(void)       { return (double)(rng_next() >> 11) / (double)
 
 #define GZ_BUF   (128 * 1024)
 #define GZ_SLIDE (32 * 1024)
+
+/* Gzip JSON stream reader ------------------------------------------------- */
 
 typedef struct {
     gzFile gz;
@@ -98,6 +104,8 @@ static float stream_f32(GzStream *r) {
     return (float)(neg ? -v : v);
 }
 
+/* Reference dataset ------------------------------------------------------- */
+
 static float   *g_vecs = NULL;  
 static uint8_t *g_lbls = NULL;  
 static int      g_n    = 0;
@@ -147,6 +155,8 @@ done:
     gzclose(gz);
     g_n = n;
 }
+
+/* K-means helpers --------------------------------------------------------- */
 
 static inline float sq_dist(const float *a, const float *b) {
     float d = 0;
@@ -217,15 +227,17 @@ static void centroid_transpose(const float *c, float *ct, int k) {
             ct[d*k+i] = c[i*DIMS+d];
 }
 
+/* Parallel assignment ----------------------------------------------------- */
+
 typedef struct {
     const float *ct;
     uint16_t *asgn;
     int k, start, end;
     size_t changed;
-} WorkSlice;
+} AssignSlice;
 
 static void *assign_slice(void *arg) {
-    WorkSlice *a = arg;
+    AssignSlice *a = arg;
     a->changed = 0;
     for (int i = a->start; i < a->end; i++) {
         uint16_t best = nearest_centroid(&g_vecs[(size_t)i*DIMS], a->ct, a->k);
@@ -240,13 +252,13 @@ static size_t parallel_assign(const float *ct, int k, uint16_t *asgn) {
     if (nt > MAX_THREADS) nt = MAX_THREADS;
 
     pthread_t thr[MAX_THREADS];
-    WorkSlice arg[MAX_THREADS];
+    AssignSlice arg[MAX_THREADS];
     int chunk = (g_n + nt - 1) / nt;
 
     for (int t = 0; t < nt; t++) {
-        arg[t] = (WorkSlice){ .ct=ct, .asgn=asgn, .k=k,
-                              .start=t*chunk,
-                              .end=(t+1)*chunk < g_n ? (t+1)*chunk : g_n };
+        arg[t] = (AssignSlice){ .ct=ct, .asgn=asgn, .k=k,
+                                .start=t*chunk,
+                                .end=(t+1)*chunk < g_n ? (t+1)*chunk : g_n };
         pthread_create(&thr[t], NULL, assign_slice, &arg[t]);
     }
     size_t changed = 0;
@@ -273,6 +285,7 @@ static void recompute_centroids(float *centroids, const uint16_t *asgn, int k) {
     free(sums); free(cnt);
 }
 
+/* IVF writer -------------------------------------------------------------- */
 
 static void write_ivf(const char *path, const float *centroids, int k, const uint16_t *asgn) {
     int n = g_n;
@@ -364,6 +377,9 @@ static void write_ivf(const char *path, const float *centroids, int k, const uin
 }
 
 #ifndef RINHA_BUILD_IVF_NO_MAIN
+
+/* Entry point ------------------------------------------------------------- */
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <references.json.gz> <output.ivf> [N_CLUSTERS]\n", argv[0]);
