@@ -1,7 +1,7 @@
 CC = gcc
 BUILD_DIR ?= build
 
-HASWELL_FLAGS ?= -O3 -march=haswell
+HASWELL_FLAGS ?= -O3 -march=haswell -flto
 AVX_FLAGS ?= $(HASWELL_FLAGS) -mavx2 -mfma
 API_DEFS ?= -DRINHA_ASSUME_PASSED_FD_FLAGS
 

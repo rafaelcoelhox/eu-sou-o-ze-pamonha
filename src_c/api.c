@@ -69,7 +69,7 @@ static const uint8_t  *g_labels;
 static const int16_t  *g_blocks;
 static int             g_k;
 
-static float g_dists[4096];
+static float g_dists[4096] __attribute__((aligned(64)));
 
 static void load_index(const char *path) {
     int fd = open(path, O_RDONLY);
@@ -95,17 +95,27 @@ static void load_index(const char *path) {
     mlock(base, sz);
 
     IvfHeader *hdr = (IvfHeader*)base;
-    if (memcmp(hdr->magic, "CIVF2\0\0\0", 8)) {
+    if (memcmp(hdr->magic, "CIVF3\0\0\0", 8)) {
         fputs("Invalid index magic\n", stderr); exit(1);
     }
     g_k = (int)hdr->k;
 
-    const char *p = base + sizeof(IvfHeader);
-    g_ct      = (const float*)p;    p += (size_t)DIMS * g_k * sizeof(float);
-    g_offsets = (const uint32_t*)p; p += (size_t)(g_k+1) * sizeof(uint32_t);
-    g_labels  = (const uint8_t*)p;  p += hdr->padded_n;
-    g_blocks  = (const int16_t*)p;
-
+    /*
+     * Cada seção começa em offset múltiplo de 32 — o writer (build_ivf) injeta
+     * padding entre elas. Permite _mm256_load_ps em g_ct e _mm_load_si128 nos
+     * blocos sem split-load penalty.
+     */
+    #define ALIGN_UP32(x) (((x) + 31u) & ~(size_t)31u)
+    size_t off = sizeof(IvfHeader);
+    off = ALIGN_UP32(off);
+    g_ct      = (const float*)(base + off);    off += (size_t)DIMS * g_k * sizeof(float);
+    off = ALIGN_UP32(off);
+    g_offsets = (const uint32_t*)(base + off); off += (size_t)(g_k+1) * sizeof(uint32_t);
+    off = ALIGN_UP32(off);
+    g_labels  = (const uint8_t*)(base + off);  off += hdr->padded_n;
+    off = ALIGN_UP32(off);
+    g_blocks  = (const int16_t*)(base + off);
+    #undef ALIGN_UP32
 }
 
 static uint8_t day_of_week(uint16_t y, uint8_t m, uint8_t d) {
@@ -332,10 +342,10 @@ static void compute_centroid_dists(const float *q, const float *ct, int k, float
         __m256 qd = _mm256_set1_ps(q[0]);
         int ci;
         for (ci=0; ci+16<=k; ci+=16) {
-            __m256 d0=_mm256_sub_ps(_mm256_loadu_ps(cp+ci),   qd);
-            __m256 d1=_mm256_sub_ps(_mm256_loadu_ps(cp+ci+8), qd);
-            _mm256_storeu_ps(dists+ci,   _mm256_mul_ps(d0,d0));
-            _mm256_storeu_ps(dists+ci+8, _mm256_mul_ps(d1,d1));
+            __m256 d0=_mm256_sub_ps(_mm256_load_ps(cp+ci),   qd);
+            __m256 d1=_mm256_sub_ps(_mm256_load_ps(cp+ci+8), qd);
+            _mm256_store_ps(dists+ci,   _mm256_mul_ps(d0,d0));
+            _mm256_store_ps(dists+ci+8, _mm256_mul_ps(d1,d1));
         }
         for (; ci<k; ci++) { float d=cp[ci]-q[0]; dists[ci]=d*d; }
     }
@@ -344,11 +354,11 @@ static void compute_centroid_dists(const float *q, const float *ct, int k, float
         __m256 qd = _mm256_set1_ps(q[d]);
         int ci;
         for (ci=0; ci+16<=k; ci+=16) {
-            __m256 cv0=_mm256_loadu_ps(cp+ci);   __m256 cv1=_mm256_loadu_ps(cp+ci+8);
+            __m256 cv0=_mm256_load_ps(cp+ci);    __m256 cv1=_mm256_load_ps(cp+ci+8);
             __m256 d0 =_mm256_sub_ps(cv0,qd);    __m256 d1 =_mm256_sub_ps(cv1,qd);
-            __m256 a0 =_mm256_loadu_ps(dists+ci);__m256 a1 =_mm256_loadu_ps(dists+ci+8);
-            _mm256_storeu_ps(dists+ci,   _mm256_fmadd_ps(d0,d0,a0));
-            _mm256_storeu_ps(dists+ci+8, _mm256_fmadd_ps(d1,d1,a1));
+            __m256 a0 =_mm256_load_ps(dists+ci); __m256 a1 =_mm256_load_ps(dists+ci+8);
+            _mm256_store_ps(dists+ci,   _mm256_fmadd_ps(d0,d0,a0));
+            _mm256_store_ps(dists+ci+8, _mm256_fmadd_ps(d1,d1,a1));
         }
         for (; ci<k; ci++) { float dd=cp[ci]-q[d]; dists[ci]+=dd*dd; }
     }
@@ -357,13 +367,37 @@ static void compute_centroid_dists(const float *q, const float *ct, int k, float
 static void top_n(const float *dists, int k, int n, int *out) {
     float td[FULL_NPROBE]; int ti[FULL_NPROBE];
     for (int i=0;i<n;i++){td[i]=FLT_MAX;ti[i]=0;}
-    for (int ci=0;ci<k;ci++) {
-        float di=dists[ci];
-        if (di>=td[n-1]) continue;
-        int pos=n-1;
+
+    int ci = 0;
+    for (; ci+8<=k; ci+=8) {
+        __m256 d   = _mm256_load_ps(dists+ci);
+        __m256 thr = _mm256_set1_ps(td[n-1]);
+        int mask   = _mm256_movemask_ps(_mm256_cmp_ps(d, thr, _CMP_LT_OQ));
+        if (!mask) continue;
+
+        float buf[8];
+        _mm256_storeu_ps(buf, d);
+
+        while (mask) {
+            int s = __builtin_ctz(mask);
+            mask &= mask - 1;
+            float di = buf[s];
+            if (di >= td[n-1]) continue;
+            int pos = n-1;
+            while (pos>0 && di<td[pos-1]) pos--;
+            for (int j=n-1;j>pos;j--){td[j]=td[j-1];ti[j]=ti[j-1];}
+            td[pos] = di;
+            ti[pos] = ci + s;
+        }
+    }
+    for (; ci<k; ci++) {
+        float di = dists[ci];
+        if (di >= td[n-1]) continue;
+        int pos = n-1;
         while (pos>0 && di<td[pos-1]) pos--;
         for (int j=n-1;j>pos;j--){td[j]=td[j-1];ti[j]=ti[j-1];}
-        td[pos]=di; ti[pos]=ci;
+        td[pos] = di;
+        ti[pos] = ci;
     }
     memcpy(out, ti, n*sizeof(int));
 }
@@ -378,10 +412,10 @@ static void scan_cluster(
 #define DIM_PAIR(D) { \
     const int16_t *row0=block+(D)*BLOCK_VECS; \
     const int16_t *row1=block+((D)+1)*BLOCK_VECS; \
-    __m128i r0lo=_mm_loadu_si128((__m128i*)row0); \
-    __m128i r0hi=_mm_loadu_si128((__m128i*)(row0+8)); \
-    __m128i r1lo=_mm_loadu_si128((__m128i*)row1); \
-    __m128i r1hi=_mm_loadu_si128((__m128i*)(row1+8)); \
+    __m128i r0lo=_mm_load_si128((__m128i*)row0); \
+    __m128i r0hi=_mm_load_si128((__m128i*)(row0+8)); \
+    __m128i r1lo=_mm_load_si128((__m128i*)row1); \
+    __m128i r1hi=_mm_load_si128((__m128i*)(row1+8)); \
     __m256 v0lo=_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(r0lo)),scale); \
     __m256 v0hi=_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(r0hi)),scale); \
     __m256 v1lo=_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(r1lo)),scale); \
@@ -399,13 +433,13 @@ static void scan_cluster(
     for (uint32_t bi=bs; bi<be; bi++) {
         if (bi+8<be) {
             const char *nxt=(const char*)(g_blocks+(bi+8)*(size_t)DIMS*BLOCK_VECS);
-            __builtin_prefetch(nxt,     0, 0);
-            __builtin_prefetch(nxt+ 64, 0, 0);
-            __builtin_prefetch(nxt+128, 0, 0);
-            __builtin_prefetch(nxt+192, 0, 0);
-            __builtin_prefetch(nxt+256, 0, 0);
-            __builtin_prefetch(nxt+320, 0, 0);
-            __builtin_prefetch(nxt+384, 0, 0);
+            __builtin_prefetch(nxt,     0, 3);
+            __builtin_prefetch(nxt+ 64, 0, 3);
+            __builtin_prefetch(nxt+128, 0, 3);
+            __builtin_prefetch(nxt+192, 0, 3);
+            __builtin_prefetch(nxt+256, 0, 3);
+            __builtin_prefetch(nxt+320, 0, 3);
+            __builtin_prefetch(nxt+384, 0, 3);
         }
 
         const int16_t *block=g_blocks+bi*(size_t)DIMS*BLOCK_VECS;
@@ -460,8 +494,8 @@ static void scan_cluster(
 static uint8_t knn5_search(const float *q) {
     compute_centroid_dists(q, g_ct, g_k, g_dists);
 
-    int probes[FULL_NPROBE];
-    top_n(g_dists, g_k, FULL_NPROBE, probes);
+    int probes_fast[FAST_NPROBE];
+    top_n(g_dists, g_k, FAST_NPROBE, probes_fast);
 
     __m256 qv[DIMS];
     for (int d=0;d<DIMS;d++) qv[d]=_mm256_set1_ps(q[d]);
@@ -471,15 +505,24 @@ static uint8_t knn5_search(const float *q) {
     int wi=0;
 
     for (int pi=0; pi<FAST_NPROBE; pi++) {
-        int ci=probes[pi];
+        int ci=probes_fast[pi];
         scan_cluster(qv, g_offsets[ci], g_offsets[ci+1], top5d, top5l, &wi);
     }
     uint8_t fc=0;
     for (int i=0;i<5;i++) fc+=top5l[i];
 
-    if (fc>=1 && fc<=4) {
+    /*
+     * Fronteira aprovado/reprovado: 2 → score 0.4 (aprovado), 3 → 0.6 (reprovado).
+     * Refinamos fc∈{2,3} pra reduzir FN (fraude aprovada) e fc=4 pra reduzir FP
+     * (legítima bloqueada — fast deu fc=4/5 mas refinement pode descer pra ≤2).
+     * fc=5 raríssimo em legítima; deixamos fora pra não pagar full em ~25k fraudes
+     * "óbvias". fc∈{0,1} também fora — refinaria FN, mas hoje FN=0.
+     */
+    if (fc>=2 && fc<=4) {
+        int probes_full[FULL_NPROBE];
+        top_n(g_dists, g_k, FULL_NPROBE, probes_full);
         for (int pi=FAST_NPROBE; pi<FULL_NPROBE; pi++) {
-            int ci=probes[pi];
+            int ci=probes_full[pi];
             scan_cluster(qv, g_offsets[ci], g_offsets[ci+1], top5d, top5l, &wi);
         }
         fc=0;

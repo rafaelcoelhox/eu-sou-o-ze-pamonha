@@ -18,7 +18,7 @@
 #define QUANT_SCALE   10000.0f 
 #define MAX_THREADS   16
 
-static const char MAGIC[8] = {'C','I','V','F','2',0,0,0};
+static const char MAGIC[8] = {'C','I','V','F','3',0,0,0};
 
 typedef struct __attribute__((packed)) {
     char     magic[8];
@@ -342,11 +342,24 @@ static void write_ivf(const char *path, const float *centroids, int k, const uin
     hdr.n = (uint32_t)n; hdr.k = (uint32_t)k;
     hdr.d = DIMS; hdr.total_blocks = total_blocks; hdr.padded_n = padded_n;
 
-    fwrite(&hdr,    sizeof(hdr),     1,              f);
-    fwrite(ct,      sizeof(float),   (size_t)DIMS*k, f);
-    fwrite(boff,    sizeof(uint32_t),(size_t)(k+1),  f);
-    fwrite(labels,  1,                padded_n,       f);
+    /*
+     * Pad cada seção pra começar em offset múltiplo de 32. O leitor (api.c)
+     * conta com isso pra emitir _mm256_load_ps em vez de loadu_ps.
+     */
+    static const unsigned char zeros[32] = {0};
+    #define WRITE_PAD32() do { \
+        long pos = ftell(f); \
+        if (pos < 0) { perror("ftell"); exit(1); } \
+        size_t pad = (32u - ((size_t)pos & 31u)) & 31u; \
+        if (pad) fwrite(zeros, 1, pad, f); \
+    } while (0)
+
+    fwrite(&hdr,    sizeof(hdr),     1,              f);  WRITE_PAD32();
+    fwrite(ct,      sizeof(float),   (size_t)DIMS*k, f);  WRITE_PAD32();
+    fwrite(boff,    sizeof(uint32_t),(size_t)(k+1),  f);  WRITE_PAD32();
+    fwrite(labels,  1,                padded_n,       f); WRITE_PAD32();
     fwrite(blocks,  sizeof(int16_t), (size_t)total_blocks*DIMS*BLOCK_VECS, f);
+    #undef WRITE_PAD32
     fclose(f);
 
     free(ct); free(boff); free(labels); free(blocks);
