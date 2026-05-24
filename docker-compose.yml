@@ -25,7 +25,7 @@ services:
       RINHA_SOCK: /run/sock/pamonha.sock
       RINHA_INDEX_PATH: /app/data/index.ivf
   lb:
-    image: ${RINHA_IMAGE:-ghcr.io/rafaelcoelhox/eu-sou-o-ze-pamonha:phh}
+    image: ${RINHA_IMAGE:-ghcr.io/rafaelcoelhox/eu-sou-o-ze-pamonha:pmh}
     command: ["/usr/local/bin/carro-da-pamonha"]
     depends_on:
       - canjica
