@@ -14,6 +14,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/ioctl.h>
+#include <time.h>
 #include <signal.h>
 #include <immintrin.h>
 
@@ -1004,10 +1006,82 @@ static int listen_unix_seqpacket(const char *path) {
     return fd;
 }
 
+/* Tuning do loop de epoll (porta de server.rs: busy-poll + spin + idle) ---- */
+
+static unsigned env_u32(const char *name, unsigned def) {
+    const char *v = getenv(name);
+    if (!v || !*v) return def;
+    char *end = NULL;
+    long x = strtol(v, &end, 10);
+    if (end == v || x < 0) return def;
+    return (unsigned)x;
+}
+static long env_long(const char *name, long def) {
+    const char *v = getenv(name);
+    if (!v || !*v) return def;
+    char *end = NULL;
+    long x = strtol(v, &end, 10);
+    if (end == v || x < 0) return def;
+    return x;
+}
+
+/* ioctl EPIOCSPARAMS: habilita busy-poll no fd do epoll (igual server.rs) */
+struct epoll_params {
+    uint32_t busy_poll_usecs;
+    uint16_t busy_poll_budget;
+    uint8_t  prefer_busy_poll;
+    uint8_t  __pad;
+};
+#define EPIOCSPARAMS_REQ \
+    ((unsigned long)((1u << 30) | (sizeof(struct epoll_params) << 16) | (0x8Au << 8) | 0x01u))
+
+static void configure_busy_poll(int efd) {
+    uint32_t usecs = env_u32("EPOLL_BUSY_POLL_US", 50);
+    uint8_t prefer = (uint8_t)env_u32("EPOLL_PREFER_BUSY_POLL", 1);
+    if (usecs == 0 && prefer == 0) return;
+    struct epoll_params p = {
+        .busy_poll_usecs = usecs,
+        .busy_poll_budget = (uint16_t)env_u32("EPOLL_BUSY_POLL_BUDGET", 8),
+        .prefer_busy_poll = prefer,
+        .__pad = 0,
+    };
+    ioctl(efd, EPIOCSPARAMS_REQ, &p);
+}
+
+static int wait_idle(int efd, struct epoll_event *evs, int max, long idle_us, int fallback_ms) {
+    if (idle_us <= 0) return epoll_wait(efd, evs, max, fallback_ms);
+    struct timespec ts = {
+        .tv_sec = idle_us / 1000000,
+        .tv_nsec = (idle_us % 1000000) * 1000,
+    };
+    int n = epoll_pwait2(efd, evs, max, &ts, NULL);
+    if (n < 0 && errno == ENOSYS) return epoll_wait(efd, evs, max, fallback_ms);
+    return n;
+}
+
 static void event_loop(int ctrl_sfd, int efd) {
     struct epoll_event evs[128];
+    long spin_us = env_long("EPOLL_SPIN_US", 50);
+    long idle_us = env_long("EPOLL_IDLE_US", 0);
+    int timeout_ms = (int)env_long("EPOLL_TIMEOUT_MS", 1);
+
     for (;;) {
-        int n = epoll_wait(efd, evs, 128, -1);
+        int n = epoll_wait(efd, evs, 128, 0);
+        if (n == 0 && spin_us > 0) {
+            struct timespec t0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            for (;;) {
+                n = epoll_wait(efd, evs, 128, 0);
+                if (n != 0) break;
+                struct timespec t1;
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                long el = (t1.tv_sec - t0.tv_sec) * 1000000L
+                        + (t1.tv_nsec - t0.tv_nsec) / 1000;
+                if (el >= spin_us) break;
+                _mm_pause();
+            }
+        }
+        if (n == 0) n = wait_idle(efd, evs, 128, idle_us, timeout_ms);
         if (n < 0) { if (errno == EINTR) continue; return; }
         for (int i = 0; i < n; i++) {
             EventTag *tag = (EventTag *)evs[i].data.ptr;
@@ -1075,6 +1149,7 @@ int main(void) {
 
     int efd = epoll_create1(EPOLL_CLOEXEC);
     if (efd < 0) { perror("epoll_create1"); return 1; }
+    configure_busy_poll(efd);
     struct epoll_event ev = { .events = EPOLLIN, .data.ptr = &ctrl_listener_tag };
     epoll_ctl(efd, EPOLL_CTL_ADD, ctrl_sfd, &ev);
 
