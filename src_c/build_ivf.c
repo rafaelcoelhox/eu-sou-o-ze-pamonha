@@ -5,43 +5,81 @@
 #include <stdint.h>
 #include <math.h>
 #include <float.h>
-#include <pthread.h>
 #include <unistd.h>
 #include <zlib.h>
-#include <immintrin.h>
+
+/*
+ * build_ivf  -> constrói o índice "DFKNN001" (KD-tree particionado), o mesmo
+ * formato consumido por api.c::load_index. Porta direta de
+ * detecta-fraude/src/index.rs (write_kd_pair_to / build_tree).
+ *
+ * O nome do binário continua "build_ivf" por compatibilidade com Makefile,
+ * Dockerfile e benches, mas o índice gerado já não é IVF/k-means: é a árvore
+ * KD particionada por partition_key, com blocos AVX2 pair-interleaved.
+ */
 
 #define DIMS          14
-#define DEFAULT_K     4096
-#define KMEANS_ITERS  50
-#define INIT_SAMPLE   50000
-#define BLOCK_VECS    16      
-#define QUANT_SCALE   10000.0f 
-#define MAX_THREADS   16
+#define STORE_DIM     16
+#define LANES         8
+#define BLOCK_BYTES   (DIMS * LANES * 2)        /* 14*8*2 = 224 bytes        */
+#define HEADER_SIZE   64
+#define PART_SIZE     76
+#define NODE_SIZE     80
+#define MCC_TABLE_SIZE 1024
+#define DEFAULT_LEAF_SIZE 128
+#define SCALE         10000
+#define KD_PAIR_VERSION 6
 
-/* Index format ------------------------------------------------------------ */
+#define LABEL_LEGIT   0
+#define LABEL_FRAUD   1
 
-static const char MAGIC[8] = {'C','I','V','F','3',0,0,0};
+static const char MAGIC[8] = {'D','F','K','N','N','0','0','1'};
 
 typedef struct __attribute__((packed)) {
     char     magic[8];
-    uint32_t n, k, d, total_blocks, padded_n;
-} IndexHeader;
+    uint32_t version;
+    uint32_t scale;
+    uint32_t dim;
+    uint32_t store_dim;
+    uint32_t n_points;
+    uint32_t part_count;
+    uint32_t node_count;
+    uint32_t block_count;
+    uint32_t mcc_table_offset;
+    uint8_t  _pad[20];
+} Header;
 
-/* Deterministic RNG ------------------------------------------------------- */
+_Static_assert(sizeof(Header) == HEADER_SIZE, "header size");
 
-static uint64_t g_rng;
+/* Quantização ------------------------------------------------------------- */
 
-static uint64_t rng_next(void) {
-    g_rng = g_rng * 6364136223846793005ULL + 1442695040888963407ULL;
-    return g_rng;
+static inline int16_t quantize(double v) {
+    if (v <= -1.0) return -(int16_t)SCALE;
+    if (v <= 0.0)  return 0;
+    if (v >= 1.0)  return (int16_t)SCALE;
+    return (int16_t)round(v * (double)SCALE);   /* metade p/ longe de zero (= Rust f64::round) */
 }
-static size_t rng_usize(size_t n) { return (size_t)((rng_next() >> 33) % n); }
-static double rng_f64(void)       { return (double)(rng_next() >> 11) / (double)(1ULL << 53); }
+
+/* MCC risk (idêntico a consts.rs) ----------------------------------------- */
+
+static const struct { uint32_t code; double risk; } MCC_RISK[] = {
+    {5411, 0.15}, {5812, 0.30}, {5912, 0.20}, {5944, 0.45}, {7801, 0.80},
+    {7802, 0.75}, {7995, 0.85}, {4511, 0.35}, {5311, 0.25}, {5999, 0.50},
+};
+#define MCC_RISK_N (int)(sizeof(MCC_RISK)/sizeof(MCC_RISK[0]))
+#define DEFAULT_MCC_RISK 0.5
+
+static void build_mcc_table(int16_t *table) {
+    int16_t def = quantize(DEFAULT_MCC_RISK);
+    for (int i = 0; i < MCC_TABLE_SIZE; i++) table[i] = def;
+    for (int i = 0; i < MCC_RISK_N; i++)
+        table[MCC_RISK[i].code % MCC_TABLE_SIZE] = quantize(MCC_RISK[i].risk);
+}
+
+/* Gzip JSON stream reader ------------------------------------------------- */
 
 #define GZ_BUF   (128 * 1024)
 #define GZ_SLIDE (32 * 1024)
-
-/* Gzip JSON stream reader ------------------------------------------------- */
 
 typedef struct {
     gzFile gz;
@@ -81,7 +119,7 @@ static int stream_skip(GzStream *r, int c) {
     }
 }
 
-static float stream_f32(GzStream *r) {
+static double stream_f64(GzStream *r) {
     stream_ensure(r, 64);
     const unsigned char *s = r->buf + r->pos;
     int len = r->len - r->pos, i = 0, neg = 0;
@@ -101,14 +139,14 @@ static float stream_f32(GzStream *r) {
         v *= pow(10.0, es*e);
     }
     r->pos += i;
-    return (float)(neg ? -v : v);
+    return neg ? -v : v;
 }
 
-/* Reference dataset ------------------------------------------------------- */
+/* Reference dataset (quantizado direto para i16) -------------------------- */
 
-static float   *g_vecs = NULL;  
-static uint8_t *g_lbls = NULL;  
-static int      g_n    = 0;
+static int16_t *g_qvecs = NULL;   /* [n][STORE_DIM]                          */
+static uint8_t *g_lbls  = NULL;
+static int      g_n     = 0;
 
 static void load_references(const char *path) {
     gzFile gz = gzopen(path, "rb");
@@ -118,9 +156,9 @@ static void load_references(const char *path) {
     GzStream r = {.gz=gz, .pos=0, .len=0, .eof=0};
 
     int cap = 3200000;
-    g_vecs = malloc((size_t)cap * DIMS * sizeof(float));
-    g_lbls = malloc((size_t)cap);
-    if (!g_vecs || !g_lbls) { fputs("OOM\n", stderr); exit(1); }
+    g_qvecs = malloc((size_t)cap * STORE_DIM * sizeof(int16_t));
+    g_lbls  = malloc((size_t)cap);
+    if (!g_qvecs || !g_lbls) { fputs("OOM\n", stderr); exit(1); }
 
     stream_skip(&r, '[');
 
@@ -132,21 +170,23 @@ static void load_references(const char *path) {
 
         if (n >= cap) {
             cap = cap * 3 / 2;
-            g_vecs = realloc(g_vecs, (size_t)cap * DIMS * sizeof(float));
-            g_lbls = realloc(g_lbls, (size_t)cap);
-            if (!g_vecs || !g_lbls) { fputs("OOM\n", stderr); exit(1); }
+            g_qvecs = realloc(g_qvecs, (size_t)cap * STORE_DIM * sizeof(int16_t));
+            g_lbls  = realloc(g_lbls, (size_t)cap);
+            if (!g_qvecs || !g_lbls) { fputs("OOM\n", stderr); exit(1); }
         }
 
-        float *vp = &g_vecs[(size_t)n * DIMS];
+        int16_t *qp = &g_qvecs[(size_t)n * STORE_DIM];
         for (int d = 0; d < DIMS; d++) {
             while (stream_peek(&r)==',' || stream_peek(&r)==' ') stream_getc(&r);
-            vp[d] = stream_f32(&r);
+            qp[d] = quantize(stream_f64(&r));
         }
+        for (int d = DIMS; d < STORE_DIM; d++) qp[d] = 0;   /* padding */
+
         stream_skip(&r, ']');
         stream_skip(&r, ':');
         stream_skip(&r, '"');
         int fc = stream_getc(&r);
-        g_lbls[n] = (fc == 'f') ? 1 : 0;
+        g_lbls[n] = (fc == 'f') ? LABEL_FRAUD : LABEL_LEGIT;
         stream_skip(&r, '}');
 
         n++;
@@ -156,259 +196,288 @@ done:
     g_n = n;
 }
 
-/* K-means helpers --------------------------------------------------------- */
+/* partition_key (idêntico a index.rs::partition_key) ---------------------- */
 
-static inline float sq_dist(const float *a, const float *b) {
-    float d = 0;
-    for (int i = 0; i < DIMS; i++) { float x = a[i]-b[i]; d += x*x; }
-    return d;
+static uint32_t partition_key(const int16_t *v) {
+    uint32_t key = 0;
+    if (v[5] >= 0)  key |= 1u << 0;
+    if (v[9] > 0)   key |= 1u << 1;
+    if (v[10] > 0)  key |= 1u << 2;
+    if (v[11] > 0)  key |= 1u << 3;
+    int16_t mr = v[12];
+    if (mr <= 2047) { /* 0 */ }
+    else if (mr <= 4095) key |= 1u << 4;
+    else if (mr <= 6143) key |= 2u << 4;
+    else                 key |= 3u << 4;
+    if (v[2] > 4096) key |= 1u << 6;
+    if (v[8] > 2048) key |= 1u << 7;
+    return key;
 }
 
-static uint16_t nearest_centroid(const float *v, const float *ct, int k) {
-    float dists[4096];
-    int ci;
+/* KD-tree builder --------------------------------------------------------- */
 
-    { const float *cp = ct; __m256 qd = _mm256_set1_ps(v[0]);
-      for (ci=0; ci+16<=k; ci+=16) {
-        __m256 d0=_mm256_sub_ps(_mm256_loadu_ps(cp+ci),   qd);
-        __m256 d1=_mm256_sub_ps(_mm256_loadu_ps(cp+ci+8), qd);
-        _mm256_storeu_ps(dists+ci,   _mm256_mul_ps(d0,d0));
-        _mm256_storeu_ps(dists+ci+8, _mm256_mul_ps(d1,d1));
-      }
-      for (; ci<k; ci++) { float d=cp[ci]-v[0]; dists[ci]=d*d; }
+typedef struct {
+    int32_t left, right, start, len;
+    int16_t min[STORE_DIM];
+    int16_t max[STORE_DIM];
+} BuildNode;
+
+static BuildNode *g_nodes = NULL;
+static size_t     g_node_n = 0, g_node_cap = 0;
+
+/* blocos: vetor i16[STORE_DIM] + label por slot                            */
+static int16_t  *g_block_vecs = NULL;   /* [slot][STORE_DIM] */
+static uint8_t  *g_block_lbls = NULL;
+static size_t    g_block_n = 0, g_block_cap = 0;
+
+static size_t node_push(void) {
+    if (g_node_n >= g_node_cap) {
+        g_node_cap = g_node_cap ? g_node_cap * 2 : 4096;
+        g_nodes = realloc(g_nodes, g_node_cap * sizeof(BuildNode));
+        if (!g_nodes) { fputs("OOM nodes\n", stderr); exit(1); }
     }
-    for (int d=1; d<DIMS; d++) {
-        const float *cp = ct+d*k; __m256 qd = _mm256_set1_ps(v[d]);
-        for (ci=0; ci+16<=k; ci+=16) {
-          __m256 a0=_mm256_loadu_ps(dists+ci),   a1=_mm256_loadu_ps(dists+ci+8);
-          __m256 c0=_mm256_loadu_ps(cp+ci),       c1=_mm256_loadu_ps(cp+ci+8);
-          _mm256_storeu_ps(dists+ci,   _mm256_fmadd_ps(_mm256_sub_ps(c0,qd),_mm256_sub_ps(c0,qd),a0));
-          _mm256_storeu_ps(dists+ci+8, _mm256_fmadd_ps(_mm256_sub_ps(c1,qd),_mm256_sub_ps(c1,qd),a1));
+    return g_node_n++;
+}
+
+static void block_reserve(size_t extra) {
+    if (g_block_n + extra > g_block_cap) {
+        while (g_block_n + extra > g_block_cap)
+            g_block_cap = g_block_cap ? g_block_cap * 2 : (1 << 16);
+        g_block_vecs = realloc(g_block_vecs, g_block_cap * STORE_DIM * sizeof(int16_t));
+        g_block_lbls = realloc(g_block_lbls, g_block_cap);
+        if (!g_block_vecs || !g_block_lbls) { fputs("OOM blocks\n", stderr); exit(1); }
+    }
+}
+
+static void bounds(const int *idx, int n, int16_t *lo, int16_t *hi) {
+    for (int d = 0; d < STORE_DIM; d++) { lo[d] = INT16_MAX; hi[d] = INT16_MIN; }
+    for (int i = 0; i < n; i++) {
+        const int16_t *v = &g_qvecs[(size_t)idx[i] * STORE_DIM];
+        for (int d = 0; d < STORE_DIM; d++) {
+            if (v[d] < lo[d]) lo[d] = v[d];
+            if (v[d] > hi[d]) hi[d] = v[d];
         }
-        for (; ci<k; ci++) { float dd=cp[ci]-v[d]; dists[ci]+=dd*dd; }
     }
-    uint16_t best=0; float bv=dists[0];
-    for (ci=1; ci<k; ci++) if (dists[ci]<bv) { bv=dists[ci]; best=(uint16_t)ci; }
+}
+
+static int widest_dim(const int16_t *lo, const int16_t *hi) {
+    int best = 0; int32_t bw = INT32_MIN;
+    for (int d = 0; d < DIMS; d++) {
+        int32_t w = (int32_t)hi[d] - (int32_t)lo[d];
+        if (w > bw) { bw = w; best = d; }
+    }
     return best;
 }
 
-static void kmeanspp_init(float *centroids, int k) {
-    int n = g_n;
-    int ss = n < INIT_SAMPLE ? n : INIT_SAMPLE;
-    if (ss <= 0) exit(1);
-    int *sample = malloc((size_t)ss * sizeof(int));
-    for (int i = 0; i < ss; i++) sample[i] = (int)rng_usize((size_t)n);
+static int g_split_dim;
+static int cmp_split(const void *a, const void *b) {
+    int ia = *(const int *)a, ib = *(const int *)b;
+    int16_t va = g_qvecs[(size_t)ia * STORE_DIM + g_split_dim];
+    int16_t vb = g_qvecs[(size_t)ib * STORE_DIM + g_split_dim];
+    return (va > vb) - (va < vb);
+}
 
-    int first = sample[rng_usize((size_t)ss)];
-    memcpy(centroids, &g_vecs[(size_t)first*DIMS], DIMS*sizeof(float));
+/* Constrói recursivamente; retorna índice do nó. */
+static size_t build_tree(int *idx, int n, int leaf_size) {
+    int16_t lo[STORE_DIM], hi[STORE_DIM];
+    bounds(idx, n, lo, hi);
 
-    float *min_d2 = malloc((size_t)ss * sizeof(float));
-    for (int i = 0; i < ss; i++) min_d2[i] = FLT_MAX;
+    size_t node_idx = node_push();
+    BuildNode *node = &g_nodes[node_idx];
+    node->left = -1; node->right = -1; node->start = 0; node->len = n;
+    memcpy(node->min, lo, sizeof(lo));
+    memcpy(node->max, hi, sizeof(hi));
 
-    for (int ci = 1; ci < k; ci++) {
-        const float *last = centroids + (ci-1)*DIMS;
-        for (int i = 0; i < ss; i++) {
-            float d = sq_dist(&g_vecs[(size_t)sample[i]*DIMS], last);
-            if (d < min_d2[i]) min_d2[i] = d;
+    if (n <= leaf_size) {
+        size_t start_slot = g_block_n;
+        block_reserve((size_t)n + LANES);
+        for (int i = 0; i < n; i++) {
+            memcpy(&g_block_vecs[g_block_n * STORE_DIM],
+                   &g_qvecs[(size_t)idx[i] * STORE_DIM], STORE_DIM * sizeof(int16_t));
+            g_block_lbls[g_block_n] = g_lbls[idx[i]];
+            g_block_n++;
         }
-        double total = 0;
-        for (int i = 0; i < ss; i++) total += min_d2[i];
-        double r = rng_f64() * total, cum = 0;
-        int chosen = ss - 1;
-        for (int i = 0; i < ss; i++) { cum += min_d2[i]; if (cum >= r) { chosen=i; break; } }
-        memcpy(centroids + ci*DIMS, &g_vecs[(size_t)sample[chosen]*DIMS], DIMS*sizeof(float));
+        while (g_block_n % LANES != 0) {
+            int16_t *slot = &g_block_vecs[g_block_n * STORE_DIM];
+            for (int d = 0; d < STORE_DIM; d++) slot[d] = INT16_MAX;
+            g_block_lbls[g_block_n] = LABEL_LEGIT;
+            g_block_n++;
+        }
+        node = &g_nodes[node_idx];   /* node_push pode ter realocado */
+        node->start = (int32_t)start_slot;
+        node->len = n;
+        return node_idx;
     }
-    free(sample); free(min_d2);
+
+    int split = widest_dim(lo, hi);
+    g_split_dim = split;
+    qsort(idx, n, sizeof(int), cmp_split);
+    int mid = n / 2;
+
+    size_t left  = build_tree(idx, mid, leaf_size);
+    size_t right = build_tree(idx + mid, n - mid, leaf_size);
+
+    node = &g_nodes[node_idx];
+    node->left  = (int32_t)left;
+    node->right = (int32_t)right;
+    node->start = g_nodes[left].start;
+    node->len   = g_nodes[left].len + g_nodes[right].len;
+    return node_idx;
 }
 
-static void centroid_transpose(const float *c, float *ct, int k) {
-    for (int d = 0; d < DIMS; d++)
-        for (int i = 0; i < k; i++)
-            ct[d*k+i] = c[i*DIMS+d];
+/* Layout pair-interleaved: índice i16 dentro do bloco ---------------------- */
+static inline size_t ivf_pair_offset(int d, int lane) {
+    return (size_t)(d / 2) * LANES * 2 + (size_t)lane * 2 + (size_t)(d & 1);
 }
 
-/* Parallel assignment ----------------------------------------------------- */
+/* Escrita do índice ------------------------------------------------------- */
 
-typedef struct {
-    const float *ct;
-    uint16_t *asgn;
-    int k, start, end;
-    size_t changed;
-} AssignSlice;
-
-static void *assign_slice(void *arg) {
-    AssignSlice *a = arg;
-    a->changed = 0;
-    for (int i = a->start; i < a->end; i++) {
-        uint16_t best = nearest_centroid(&g_vecs[(size_t)i*DIMS], a->ct, a->k);
-        if (best != a->asgn[i]) { a->asgn[i] = best; a->changed++; }
-    }
-    return NULL;
+static void put_u32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
+static void put_i32(uint8_t *p, int32_t v)  { memcpy(p, &v, 4); }
+static void write_qv(uint8_t *dst, const int16_t *v) {
+    memcpy(dst, v, STORE_DIM * sizeof(int16_t));
 }
 
-static size_t parallel_assign(const float *ct, int k, uint16_t *asgn) {
-    int nt = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (nt < 1) nt = 1;
-    if (nt > MAX_THREADS) nt = MAX_THREADS;
+typedef struct { uint32_t key; int32_t root; } PartitionRoot;
 
-    pthread_t thr[MAX_THREADS];
-    AssignSlice arg[MAX_THREADS];
-    int chunk = (g_n + nt - 1) / nt;
+static void write_index(const char *path, int leaf_size) {
+    /* buckets por partition_key */
+    int *bucket_idx[256];
+    int  bucket_n[256] = {0};
+    int  bucket_cap[256] = {0};
+    for (int k = 0; k < 256; k++) bucket_idx[k] = NULL;
 
-    for (int t = 0; t < nt; t++) {
-        arg[t] = (AssignSlice){ .ct=ct, .asgn=asgn, .k=k,
-                                .start=t*chunk,
-                                .end=(t+1)*chunk < g_n ? (t+1)*chunk : g_n };
-        pthread_create(&thr[t], NULL, assign_slice, &arg[t]);
-    }
-    size_t changed = 0;
-    for (int t = 0; t < nt; t++) { pthread_join(thr[t], NULL); changed += arg[t].changed; }
-    return changed;
-}
-
-static void recompute_centroids(float *centroids, const uint16_t *asgn, int k) {
-    double *sums  = calloc((size_t)k * DIMS, sizeof(double));
-    uint32_t *cnt = calloc((size_t)k, sizeof(uint32_t));
     for (int i = 0; i < g_n; i++) {
-        int ci = asgn[i]; cnt[ci]++;
-        const float *vp = &g_vecs[(size_t)i*DIMS];
-        double *sp = &sums[(size_t)ci*DIMS];
-        for (int d = 0; d < DIMS; d++) sp[d] += vp[d];
-    }
-    for (int ci = 0; ci < k; ci++) {
-        if (!cnt[ci]) continue;
-        double inv = 1.0 / cnt[ci];
-        float *cp = centroids + ci*DIMS;
-        double *sp = &sums[(size_t)ci*DIMS];
-        for (int d = 0; d < DIMS; d++) cp[d] = (float)(sp[d] * inv);
-    }
-    free(sums); free(cnt);
-}
-
-/* IVF writer -------------------------------------------------------------- */
-
-static void write_ivf(const char *path, const float *centroids, int k, const uint16_t *asgn) {
-    int n = g_n;
-
-    int **cvecs = calloc((size_t)k, sizeof(int*));
-    int  *csz   = calloc((size_t)k, sizeof(int));
-    int  *ccap  = calloc((size_t)k, sizeof(int));
-    for (int i = 0; i < n; i++) {
-        int ci = asgn[i];
-        if (csz[ci] >= ccap[ci]) {
-            ccap[ci] = ccap[ci] ? ccap[ci]*2 : 8;
-            cvecs[ci] = realloc(cvecs[ci], (size_t)ccap[ci]*sizeof(int));
+        uint32_t key = partition_key(&g_qvecs[(size_t)i * STORE_DIM]);
+        if (bucket_n[key] >= bucket_cap[key]) {
+            bucket_cap[key] = bucket_cap[key] ? bucket_cap[key] * 2 : 1024;
+            bucket_idx[key] = realloc(bucket_idx[key], (size_t)bucket_cap[key] * sizeof(int));
+            if (!bucket_idx[key]) { fputs("OOM bucket\n", stderr); exit(1); }
         }
-        cvecs[ci][csz[ci]++] = i;
+        bucket_idx[key][bucket_n[key]++] = i;
     }
 
-    uint32_t *boff = malloc((size_t)(k+1)*sizeof(uint32_t));
-    uint32_t total_blocks = 0;
-    for (int ci = 0; ci < k; ci++) {
-        boff[ci] = total_blocks;
-        total_blocks += (uint32_t)((csz[ci] + BLOCK_VECS - 1) / BLOCK_VECS);
+    PartitionRoot roots[256];
+    int part_count = 0;
+    for (int k = 0; k < 256; k++) {
+        if (bucket_n[k] == 0) continue;
+        size_t root = build_tree(bucket_idx[k], bucket_n[k], leaf_size);
+        roots[part_count].key = (uint32_t)k;
+        roots[part_count].root = (int32_t)root;
+        part_count++;
+        free(bucket_idx[k]);
     }
-    boff[k] = total_blocks;
-    uint32_t padded_n = total_blocks * BLOCK_VECS;
 
-    uint8_t  *labels = calloc(padded_n, 1);
-    int16_t  *blocks = calloc((size_t)total_blocks * DIMS * BLOCK_VECS, sizeof(int16_t));
+    if (g_block_n % LANES != 0) { fputs("block align bug\n", stderr); exit(1); }
+    size_t block_count = g_block_n / LANES;
 
-    for (int ci = 0; ci < k; ci++) {
-        uint32_t bs = boff[ci];
-        int sz = csz[ci], *vs = cvecs[ci];
-        uint32_t nb = boff[ci+1] - bs;
+    size_t partitions_off = HEADER_SIZE;
+    size_t nodes_off   = partitions_off + (size_t)part_count * PART_SIZE;
+    size_t vectors_off = nodes_off + g_node_n * NODE_SIZE;
+    size_t labels_off  = vectors_off + block_count * BLOCK_BYTES;
+    size_t mcc_off     = labels_off + block_count * LANES;
+    size_t total       = mcc_off + (size_t)MCC_TABLE_SIZE * 2;
 
-        for (uint32_t bk = 0; bk < nb; bk++) {
-            size_t bb = (size_t)(bs+bk) * DIMS * BLOCK_VECS;
-            size_t lb = (size_t)(bs+bk) * BLOCK_VECS;
-            for (int slot = 0; slot < BLOCK_VECS; slot++) {
-                int vi = (int)bk*BLOCK_VECS + slot;
-                if (vi < sz) {
-                    const float *vp = &g_vecs[(size_t)vs[vi]*DIMS];
-                    for (int d = 0; d < DIMS; d++) {
-                        float q = roundf(vp[d] * QUANT_SCALE);
-                        if (q < -32767.f) q = -32767.f;
-                        if (q >  32767.f) q =  32767.f;
-                        blocks[bb + d*BLOCK_VECS + slot] = (int16_t)q;
-                    }
-                    labels[lb+slot] = g_lbls[vs[vi]];
-                } else {
-                    for (int d = 0; d < DIMS; d++)
-                        blocks[bb + d*BLOCK_VECS + slot] = INT16_MAX;
-                    labels[lb+slot] = 0;
-                }
+    uint8_t *out = calloc(total, 1);
+    if (!out) { fputs("OOM out\n", stderr); exit(1); }
+
+    Header hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    memcpy(hdr.magic, MAGIC, 8);
+    hdr.version = KD_PAIR_VERSION;
+    hdr.scale = SCALE;
+    hdr.dim = DIMS;
+    hdr.store_dim = STORE_DIM;
+    hdr.n_points = (uint32_t)g_n;
+    hdr.part_count = (uint32_t)part_count;
+    hdr.node_count = (uint32_t)g_node_n;
+    hdr.block_count = (uint32_t)block_count;
+    hdr.mcc_table_offset = (uint32_t)mcc_off;
+    memcpy(out, &hdr, HEADER_SIZE);
+
+    for (int i = 0; i < part_count; i++) {
+        size_t off = partitions_off + (size_t)i * PART_SIZE;
+        BuildNode *n = &g_nodes[roots[i].root];
+        put_u32(out + off,      roots[i].key);
+        put_i32(out + off + 4,  roots[i].root);
+        put_i32(out + off + 8,  n->len);
+        write_qv(out + off + 12, n->min);
+        write_qv(out + off + 44, n->max);
+    }
+
+    for (size_t i = 0; i < g_node_n; i++) {
+        size_t off = nodes_off + i * NODE_SIZE;
+        BuildNode *n = &g_nodes[i];
+        put_i32(out + off,     n->left);
+        put_i32(out + off + 4, n->right);
+        int32_t start_block = (n->left < 0) ? (n->start / LANES) : n->start;
+        put_i32(out + off + 8,  start_block);
+        put_i32(out + off + 12, n->len);
+        write_qv(out + off + 16, n->min);
+        write_qv(out + off + 48, n->max);
+    }
+
+    /* vetores em layout pair-interleaved */
+    for (size_t b = 0; b < block_count; b++) {
+        size_t block_off = vectors_off + b * BLOCK_BYTES;
+        for (int d = 0; d < DIMS; d++) {
+            for (int lane = 0; lane < LANES; lane++) {
+                size_t slot = b * LANES + lane;
+                int16_t val = g_block_vecs[slot * STORE_DIM + d];
+                size_t dst = block_off + ivf_pair_offset(d, lane) * 2;
+                memcpy(out + dst, &val, 2);
             }
         }
     }
 
-    float *ct = malloc((size_t)DIMS * k * sizeof(float));
-    for (int ci = 0; ci < k; ci++)
-        for (int d = 0; d < DIMS; d++)
-            ct[d*k+ci] = centroids[ci*DIMS+d];
+    for (size_t b = 0; b < block_count; b++) {
+        size_t base = labels_off + b * LANES;
+        for (int lane = 0; lane < LANES; lane++)
+            out[base + lane] = g_block_lbls[b * LANES + lane];
+    }
+
+    int16_t mcc_table[MCC_TABLE_SIZE];
+    build_mcc_table(mcc_table);
+    for (int i = 0; i < MCC_TABLE_SIZE; i++)
+        memcpy(out + mcc_off + (size_t)i * 2, &mcc_table[i], 2);
 
     FILE *f = fopen(path, "wb");
     if (!f) { perror(path); exit(1); }
-
-    IndexHeader hdr;
-    memcpy(hdr.magic, MAGIC, 8);
-    hdr.n = (uint32_t)n; hdr.k = (uint32_t)k;
-    hdr.d = DIMS; hdr.total_blocks = total_blocks; hdr.padded_n = padded_n;
-
-    static const unsigned char zeros[32] = {0};
-    #define WRITE_PAD32() do { \
-        long pos = ftell(f); \
-        if (pos < 0) { perror("ftell"); exit(1); } \
-        size_t pad = (32u - ((size_t)pos & 31u)) & 31u; \
-        if (pad) fwrite(zeros, 1, pad, f); \
-    } while (0)
-
-    fwrite(&hdr,    sizeof(hdr),     1,              f);  WRITE_PAD32();
-    fwrite(ct,      sizeof(float),   (size_t)DIMS*k, f);  WRITE_PAD32();
-    fwrite(boff,    sizeof(uint32_t),(size_t)(k+1),  f);  WRITE_PAD32();
-    fwrite(labels,  1,                padded_n,       f); WRITE_PAD32();
-    fwrite(blocks,  sizeof(int16_t), (size_t)total_blocks*DIMS*BLOCK_VECS, f);
-    #undef WRITE_PAD32
+    if (fwrite(out, 1, total, f) != total) { perror("write index"); exit(1); }
     fclose(f);
+    free(out);
 
-    free(ct); free(boff); free(labels); free(blocks);
-    for (int ci = 0; ci < k; ci++) free(cvecs[ci]);
-    free(cvecs); free(csz); free(ccap);
+    fprintf(stderr,
+        "[builder] %d pontos, %d partições, %zu nós, %zu blocos -> %s (%.1f MB)\n",
+        g_n, part_count, g_node_n, block_count, path, total / 1e6);
+}
+
+static int leaf_size_from_env(void) {
+    const char *e = getenv("KD_LEAF_SIZE");
+    if (!e || !*e) return DEFAULT_LEAF_SIZE;
+    int v = atoi(e);
+    if (v >= LANES && v <= 1024) return v;
+    return DEFAULT_LEAF_SIZE;
 }
 
 #ifndef RINHA_BUILD_IVF_NO_MAIN
 
-/* Entry point ------------------------------------------------------------- */
-
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <references.json.gz> <output.ivf> [N_CLUSTERS]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <references.json.gz> <output.ivf> [ignored]\n", argv[0]);
         return 1;
     }
-    int k = (argc >= 4) ? atoi(argv[3]) : DEFAULT_K;
-
-    g_rng = 0xf3a8c01d4e729b56ULL;
+    /* 3º argumento posicional (antes N_CLUSTERS do IVF) é ignorado; o tamanho
+     * da folha vem de KD_LEAF_SIZE. Mantido para não quebrar o Dockerfile. */
+    int leaf_size = leaf_size_from_env();
 
     load_references(argv[1]);
+    if (g_n == 0) { fputs("no references\n", stderr); return 1; }
 
-    float *centroids = malloc((size_t)k * DIMS * sizeof(float));
-    float *ct        = malloc((size_t)DIMS * k * sizeof(float));
-    uint16_t *asgn   = calloc((size_t)g_n, sizeof(uint16_t));
+    write_index(argv[2], leaf_size);
 
-    kmeanspp_init(centroids, k);
-    centroid_transpose(centroids, ct, k);
-
-    for (int iter = 0; iter < KMEANS_ITERS; iter++) {
-        size_t changed = parallel_assign(ct, k, asgn);
-        recompute_centroids(centroids, asgn, k);
-        centroid_transpose(centroids, ct, k);
-        if (changed * 1000 < (size_t)g_n) break;
-    }
-
-    write_ivf(argv[2], centroids, k, asgn);
-
-    free(centroids); free(ct); free(asgn);
-    free(g_vecs); free(g_lbls);
+    free(g_qvecs); free(g_lbls); free(g_nodes);
+    free(g_block_vecs); free(g_block_lbls);
     return 0;
 }
 #endif

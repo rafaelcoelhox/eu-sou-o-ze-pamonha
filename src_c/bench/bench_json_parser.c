@@ -37,19 +37,20 @@ int main(int argc, char **argv) {
             }
 
             Payload px;
-            if (!parse_json(span.ptr, (int)span.len, &px)) {
+            if (!parse_payload(span.ptr, (int)span.len, &px)) {
                 continue;
             }
 
             if (do_vectorize) {
-                float v[DIMS];
+                int16_t v[STORE_DIM];
                 vectorize(&px, v);
                 bench_json_sink_f += (double)v[0] + (double)v[12];
             } else {
                 bench_json_sink_f += (double)px.amount;
             }
 
-            bench_json_sink_u += px.mcc + px.tx_count_24h + px.installments;
+            bench_json_sink_u += px.tx_count_24h + px.installments
+                              + (uint32_t)px.merchant_mcc_len;
             ok++;
         }
     }

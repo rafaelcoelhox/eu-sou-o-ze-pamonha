@@ -10,8 +10,8 @@ RUN mkdir -p src_c
 COPY src_c/api.c src_c/build_ivf.c src_c/lb.c ./src_c/
 COPY resources ./resources
 
-RUN gcc -O3 -march=haswell -mavx2 -mfma -pthread \
-    -o build_ivf src_c/build_ivf.c -lz -lm -lpthread
+RUN gcc -O3 -march=haswell -mavx2 -mfma \
+    -o build_ivf src_c/build_ivf.c -lz -lm
 
 RUN gcc -O3 -march=haswell -mavx2 -mfma \
     -DRINHA_ASSUME_PASSED_FD_FLAGS \
@@ -21,7 +21,7 @@ RUN gcc -O3 -march=haswell \
     -o carro-da-pamonha src_c/lb.c
 
 RUN mkdir -p /out && \
-    ./build_ivf resources/references.json.gz /out/index.ivf 4096
+    ./build_ivf resources/references.json.gz /out/index.ivf
 
 FROM debian:bookworm-slim AS runtime
 

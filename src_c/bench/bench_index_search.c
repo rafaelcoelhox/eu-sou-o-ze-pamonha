@@ -6,7 +6,7 @@
 #include "bench_common.h"
 
 typedef struct {
-    float v[DIMS];
+    int16_t v[STORE_DIM];
 } BenchQuery;
 
 static volatile uint64_t bench_search_sink;
@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
         }
 
         Payload px;
-        if (!parse_json(span.ptr, (int)span.len, &px)) {
+        if (!parse_payload(span.ptr, (int)span.len, &px)) {
             continue;
         }
 
@@ -58,13 +58,13 @@ int main(int argc, char **argv) {
     }
 
     for (size_t i = 0; i < qn; i++) {
-        bench_search_sink += knn5_search(queries[i].v);
+        bench_search_sink += fraud_count(queries[i].v);
     }
 
     uint64_t start = bench_now_ns();
     for (long it = 0; it < iterations; it++) {
         for (size_t i = 0; i < qn; i++) {
-            bench_search_sink += knn5_search(queries[i].v);
+            bench_search_sink += fraud_count(queries[i].v);
         }
     }
     uint64_t elapsed = bench_now_ns() - start;

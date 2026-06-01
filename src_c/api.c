@@ -4,7 +4,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
-#include <float.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -18,532 +17,667 @@
 #include <signal.h>
 #include <immintrin.h>
 
+/*
+ * canjica / pamonha -> worker HTTP de detecção de fraude.
+ *
+ * Porta direta da solução Rust detecta-fraude: índice KD-tree particionado
+ * (formato "DFKNN001" v6), vetorização i16 (SCALE=10000, STORE_DIM=16) e
+ * busca KNN (K=5) com early-exit e probing de partições por lower-bound.
+ *
+ * O transporte (epoll edge-triggered + intake de FDs via SCM_RIGHTS no socket
+ * de controle SEQPACKET) é o equivalente em C do servidor da referência e é
+ * compartilhado com o LB carro-da-pamonha.
+ */
+
 #define DIMS         14
-#define BLOCK_VECS   16
-#define VECTOR_SCALE 0.0001f
-#define FAST_NPROBE  5
-#define FULL_NPROBE  24
+#define STORE_DIM    16
+#define LANES         8
+#define K             5
+#define IVF_PAIRS    (DIMS / 2)          /* 7 pares por bloco                 */
+#define SCALE        10000
+#define BLOCK_BYTES  (DIMS * LANES * 2)  /* 224 bytes por bloco               */
+#define HEADER_SIZE  64
+#define PART_SIZE    76
+#define NODE_SIZE    80
+#define MCC_TABLE_SIZE 1024
+#define KD_PAIR_VERSION 6
+
+#define LABEL_LEGIT  0
+#define LABEL_FRAUD  1
+
+/* early-exit: best[K-1] <= (SCALE*140/1000)^2 = 1400^2 */
+#define EARLY_DISTANCE_MILLI 140
+#define EARLY_DISTANCE_LIMIT \
+    ((int64_t)((int64_t)SCALE * EARLY_DISTANCE_MILLI / 1000) * \
+              ((int64_t)SCALE * EARLY_DISTANCE_MILLI / 1000))
+
+/* normalização (consts.rs) */
+#define MAX_AMOUNT             10000.0
+#define MAX_INSTALLMENTS          12.0
+#define AMOUNT_VS_AVG_RATIO       10.0
+#define MAX_MINUTES             1440.0
+#define MAX_KM                  1000.0
+#define MAX_TX_COUNT_24H          20.0
+#define MAX_MERCHANT_AVG_AMOUNT 10000.0
+#define DEFAULT_MCC_RISK           0.5
 
 #define MAX_CONNS   512
-#define RX_BUF_SZ  8192
+#define RX_BUF_SZ  16384
 #define MAX_IOVECS   16
+#define MAX_REQ_HEAD 4096
+#define MAX_BODY     4096
 
-/* Canned HTTP responses --------------------------------------------------- */
+/* Respostas HTTP (idênticas à referência: sem Content-Type) --------------- */
 
-#define R_HDR "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+#define R_HDR(N) "HTTP/1.1 200 OK\r\nContent-Length: " N "\r\n\r\n"
 static const char *RESP_FRAUD[6] = {
-    R_HDR "35\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}",
-    R_HDR "35\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}",
-    R_HDR "35\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}",
-    R_HDR "36\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}",
-    R_HDR "36\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}",
-    R_HDR "36\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}",
+    R_HDR("35") "{\"approved\":true,\"fraud_score\":0.0}",
+    R_HDR("35") "{\"approved\":true,\"fraud_score\":0.2}",
+    R_HDR("35") "{\"approved\":true,\"fraud_score\":0.4}",
+    R_HDR("36") "{\"approved\":false,\"fraud_score\":0.6}",
+    R_HDR("36") "{\"approved\":false,\"fraud_score\":0.8}",
+    R_HDR("36") "{\"approved\":false,\"fraud_score\":1.0}",
 };
 static size_t RESP_FRAUD_LEN[6];
-static const char RESP_READY[]    = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-static const char RESP_NOT_FOUND[]= "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-static const char RESP_BAD_REQ[]  = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+static const char RESP_READY[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+/* fallback (rota desconhecida / parse falho) = aprovado, score 0.0 */
+#define RESP_FALLBACK_IDX 0
 
-/* Feature lookup tables --------------------------------------------------- */
+/* Quantização ------------------------------------------------------------- */
 
-static float mcc_risk(uint32_t mcc) {
-    switch (mcc) {
-        case 5411: return 0.15f;
-        case 5812: return 0.30f;
-        case 5912: return 0.20f;
-        case 5944: return 0.45f;
-        case 7801: return 0.80f;
-        case 7802: return 0.75f;
-        case 7995: return 0.85f;
-        case 4511: return 0.35f;
-        case 5311: return 0.25f;
-        case 5999: return 0.50f;
-        default:   return 0.50f;
+static inline int16_t quantize(double v) {
+    if (v <= -1.0) return -(int16_t)SCALE;
+    if (v <= 0.0)  return 0;
+    if (v >= 1.0)  return (int16_t)SCALE;
+    return (int16_t)round(v * (double)SCALE);
+}
+static inline double clamp01(double v) {
+    if (v < 0.0) return 0.0;
+    if (v > 1.0) return 1.0;
+    return v;
+}
+static inline int16_t quantize_clamped(double v) { return quantize(clamp01(v)); }
+
+static double mcc_risk_lookup(const char *mcc, int len) {
+    if (len != 4) return DEFAULT_MCC_RISK;
+    uint32_t code = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = mcc[i];
+        if (c < '0' || c > '9') return DEFAULT_MCC_RISK;
+        code = code * 10 + (uint32_t)(c - '0');
+    }
+    switch (code) {
+        case 5411: return 0.15;
+        case 5812: return 0.30;
+        case 5912: return 0.20;
+        case 5944: return 0.45;
+        case 7801: return 0.80;
+        case 7802: return 0.75;
+        case 7995: return 0.85;
+        case 4511: return 0.35;
+        case 5311: return 0.25;
+        case 5999: return 0.50;
+        default:   return DEFAULT_MCC_RISK;
     }
 }
 
-/* IVF index mapping ------------------------------------------------------- */
+/* Índice DFKNN001 mapeado -------------------------------------------------- */
 
 typedef struct __attribute__((packed)) {
     char     magic[8];
-    uint32_t n, k, d, total_blocks, padded_n;
-} IvfHeader;
+    uint32_t version, scale, dim, store_dim, n_points;
+    uint32_t part_count, node_count, block_count, mcc_table_offset;
+    uint8_t  _pad[20];
+} Header;
 
-static const float    *g_ct;
-static const uint32_t *g_offsets;
-static const uint8_t  *g_labels;
-static const int16_t  *g_blocks;
-static int             g_k;
+static const uint8_t *g_parts;
+static const uint8_t *g_nodes;
+static const int16_t *g_vectors;
+static const uint8_t *g_labels;
+static uint32_t       g_part_count, g_node_count, g_block_count, g_n_points;
+static int32_t        g_part_by_key[256];
 
-static float g_dists[4096] __attribute__((aligned(64)));
+static inline int32_t rd_i32(const uint8_t *p) { int32_t v; __builtin_memcpy(&v, p, 4); return v; }
+static inline uint32_t rd_u32(const uint8_t *p) { uint32_t v; __builtin_memcpy(&v, p, 4); return v; }
 
 static void load_index(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror(path); exit(1); }
     struct stat st;
-    fstat(fd, &st);
+    if (fstat(fd, &st) < 0) { perror("fstat"); exit(1); }
     size_t sz = (size_t)st.st_size;
 
-    char *base = mmap(NULL, sz, PROT_READ|PROT_WRITE,
-                      MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE, -1, 0);
+    uint8_t *base = mmap(NULL, sz, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
     if (base == MAP_FAILED) { perror("mmap index"); exit(1); }
     madvise(base, sz, MADV_HUGEPAGE);
 
-    size_t rem = sz;
-    char *wp = base;
+    size_t rem = sz; uint8_t *wp = base;
     while (rem > 0) {
-        ssize_t n = read(fd, wp, rem < (1u<<20) ? rem : (1u<<20));
+        ssize_t n = read(fd, wp, rem < (1u << 20) ? rem : (1u << 20));
         if (n <= 0) { perror("read index"); exit(1); }
         wp += n; rem -= (size_t)n;
     }
     close(fd);
-
     mlock(base, sz);
 
-    IvfHeader *hdr = (IvfHeader*)base;
-    if (memcmp(hdr->magic, "CIVF3\0\0\0", 8)) {
-        fputs("Invalid index magic\n", stderr); exit(1);
+    Header hdr;
+    __builtin_memcpy(&hdr, base, sizeof(hdr));
+    if (memcmp(hdr.magic, "DFKNN001", 8) != 0 || hdr.version != KD_PAIR_VERSION) {
+        fputs("Invalid index magic/version\n", stderr); exit(1);
     }
-    g_k = (int)hdr->k;
+    if (hdr.scale != SCALE || hdr.dim != DIMS || hdr.store_dim != STORE_DIM) {
+        fputs("Index dim/scale mismatch\n", stderr); exit(1);
+    }
 
-    #define ALIGN_UP32(x) (((x) + 31u) & ~(size_t)31u)
-    size_t off = sizeof(IvfHeader);
-    off = ALIGN_UP32(off);
-    g_ct      = (const float*)(base + off);    off += (size_t)DIMS * g_k * sizeof(float);
-    off = ALIGN_UP32(off);
-    g_offsets = (const uint32_t*)(base + off); off += (size_t)(g_k+1) * sizeof(uint32_t);
-    off = ALIGN_UP32(off);
-    g_labels  = (const uint8_t*)(base + off);  off += hdr->padded_n;
-    off = ALIGN_UP32(off);
-    g_blocks  = (const int16_t*)(base + off);
-    #undef ALIGN_UP32
+    g_part_count = hdr.part_count;
+    g_node_count = hdr.node_count;
+    g_block_count = hdr.block_count;
+    g_n_points = hdr.n_points;
+
+    size_t parts_off = HEADER_SIZE;
+    size_t nodes_off = parts_off + (size_t)g_part_count * PART_SIZE;
+    size_t vectors_off = nodes_off + (size_t)g_node_count * NODE_SIZE;
+    size_t labels_off = vectors_off + (size_t)g_block_count * BLOCK_BYTES;
+    size_t mcc_off = labels_off + (size_t)g_block_count * LANES;
+    size_t end = mcc_off + (size_t)MCC_TABLE_SIZE * 2;
+    if (end != sz || hdr.mcc_table_offset != mcc_off) {
+        fputs("Index size mismatch\n", stderr); exit(1);
+    }
+
+    g_parts = base + parts_off;
+    g_nodes = base + nodes_off;
+    g_vectors = (const int16_t *)(base + vectors_off);
+    g_labels = base + labels_off;
+
+    for (int i = 0; i < 256; i++) g_part_by_key[i] = -1;
+    for (uint32_t i = 0; i < g_part_count; i++) {
+        uint32_t key = rd_u32(g_parts + (size_t)i * PART_SIZE);
+        if (key < 256) g_part_by_key[key] = (int32_t)i;
+    }
 }
 
-/* Date/time helpers ------------------------------------------------------- */
+/* Datas (time.rs) --------------------------------------------------------- */
 
-static uint8_t day_of_week(uint16_t y, uint8_t m, uint8_t d) {
-    static const uint8_t T[12] = {0,3,2,5,0,3,5,1,4,6,2,4};
-    uint32_t ya = (m < 3) ? (uint32_t)(y-1) : (uint32_t)y;
-    uint32_t dow = (ya + ya/4 - ya/100 + ya/400 + T[m-1] + d) % 7;
-    return (uint8_t)((dow + 6) % 7);  /* Mon=0 conforme as regras */
+typedef struct { int64_t epoch_min; uint8_t hour; uint8_t weekday; } Stamp;
+
+static int64_t days_from_civil(int y, unsigned m, unsigned d) {
+    y -= (m <= 2);
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (int64_t)era * 146097 + (int64_t)doe - 719468;
 }
 
-static int64_t days_epoch(int y, uint32_t m, uint32_t d) {
-    if (m <= 2) y--;
-    int era = (y >= 0) ? y/400 : (y-399)/400;
-    uint32_t yoe = (uint32_t)(y - era*400);
-    uint32_t mm  = (m > 2) ? m-3 : m+9;
-    uint32_t doy = (153*mm+2)/5 + d - 1;
-    uint32_t doe = yoe*365 + yoe/4 - yoe/100 + doy;
-    return (int64_t)era*146097 + (int64_t)doe - 719468;
+static inline unsigned dig2(const char *b) { return (unsigned)((b[0]-'0')*10 + (b[1]-'0')); }
+static inline unsigned dig4(const char *b) {
+    return (unsigned)((b[0]-'0')*1000 + (b[1]-'0')*100 + (b[2]-'0')*10 + (b[3]-'0'));
 }
 
-static uint32_t minutes_between(
-    uint16_t y1, uint8_t m1, uint8_t d1, uint8_t h1, uint8_t mi1,
-    uint16_t y2, uint8_t m2, uint8_t d2, uint8_t h2, uint8_t mi2)
-{
-    int64_t a = days_epoch(y1,m1,d1)*1440 + h1*60 + mi1;
-    int64_t b = days_epoch(y2,m2,d2)*1440 + h2*60 + mi2;
-    int64_t diff = b - a;
-    return (uint32_t)(diff < 0 ? 0 : diff);
+static int parse_iso8601(const char *s, int len, Stamp *out) {
+    if (len < 20) return 0;
+    unsigned year = dig4(s);
+    unsigned month = dig2(s + 5);
+    unsigned day = dig2(s + 8);
+    unsigned hour = dig2(s + 11);
+    unsigned minute = dig2(s + 14);
+    unsigned second = dig2(s + 17);
+    if (month == 0 || month > 12 || day == 0 || day > 31 ||
+        hour > 23 || minute > 59 || second > 60) return 0;
+    int64_t days = days_from_civil((int)year, month, day);
+    int64_t total = days * 86400 + (int64_t)hour * 3600 + (int64_t)minute * 60 + (int64_t)second;
+    out->epoch_min = total >= 0 ? total / 60 : -((-total + 59) / 60);
+    int64_t r = ((days % 7) + 7) % 7;
+    out->weekday = (uint8_t)((r + 3) % 7);
+    out->hour = (uint8_t)hour;
+    return 1;
 }
 
-/* Payload parsing --------------------------------------------------------- */
+/* Parser JSON por chave (parse.rs) ---------------------------------------- */
 
 typedef struct {
-    float    amount, customer_avg, merchant_avg, km_home, km_current;
-    uint32_t tx_count_24h, mcc, minutes_since_last;
-    uint8_t  installments, hour, dow;
-    int      is_online, card_present, is_unknown, has_last_tx;
+    double amount;
+    uint32_t installments;
+    Stamp requested_at;
+    double customer_avg;
+    uint32_t tx_count_24h;
+    const char *known_buf; int known_len;
+    const char *merchant_id; int merchant_id_len;
+    const char *merchant_mcc; int merchant_mcc_len;
+    double merchant_avg;
+    int is_online, card_present;
+    double km_from_home;
+    int has_last_tx;
+    Stamp last_tx_stamp;
+    double last_tx_km;
 } Payload;
 
-static int next_val(const char *b, int n, int *p) {
-    while (*p < n) {
-        char c = b[*p];
-        if (c == ':') { (*p)++; while (*p<n && (b[*p]==' '||b[*p]=='\t'||b[*p]=='\n'||b[*p]=='\r')) (*p)++; return 1; }
-        if (c == '"') {
-            (*p)++;
-            const char *e = memchr(b+*p, '"', n-*p);
-            if (!e) return 0;
-            *p = (int)(e-b)+1;
-        } else (*p)++;
+static inline int p_skip_ws(const char *b, int n, int i) {
+    while (i < n) { char c = b[i]; if (c==' '||c=='\t'||c=='\n'||c=='\r') i++; else break; }
+    return i;
+}
+static inline int p_expect(const char *b, int n, int i, char c) {
+    i = p_skip_ws(b, n, i);
+    if (i >= n || b[i] != c) return -1;
+    return i + 1;
+}
+static int p_read_string(const char *b, int n, int i, const char **s, int *sl) {
+    i = p_skip_ws(b, n, i);
+    if (i >= n || b[i] != '"') return -1;
+    int start = i + 1, j = start;
+    while (j < n && b[j] != '"') j++;
+    if (j >= n) return -1;
+    *s = b + start; *sl = j - start;
+    return j + 1;
+}
+static double parse_double_span(const char *b, int len) {
+    char tmp[64];
+    if (len <= 0) return 0.0;
+    if (len > 63) len = 63;
+    memcpy(tmp, b, (size_t)len);
+    tmp[len] = '\0';
+    return strtod(tmp, NULL);
+}
+static int p_read_f64(const char *b, int n, int i, double *out) {
+    i = p_skip_ws(b, n, i);
+    int start = i, j = i;
+    if (j < n && (b[j]=='-' || b[j]=='+')) j++;
+    while (j < n) {
+        char c = b[j];
+        if ((c>='0'&&c<='9')||c=='.'||c=='e'||c=='E'||c=='-'||c=='+') j++;
+        else break;
+    }
+    if (j == start) return -1;
+    *out = parse_double_span(b + start, j - start);
+    return j;
+}
+static int p_read_u32(const char *b, int n, int i, uint32_t *out) {
+    i = p_skip_ws(b, n, i);
+    int start = i, j = i;
+    uint32_t v = 0;
+    while (j < n && b[j] >= '0' && b[j] <= '9') { v = v*10 + (uint32_t)(b[j]-'0'); j++; }
+    if (j == start) return -1;
+    *out = v;
+    return j;
+}
+static int p_read_bool(const char *b, int n, int i, int *out) {
+    i = p_skip_ws(b, n, i);
+    if (i + 4 <= n && memcmp(b+i, "true", 4) == 0) { *out = 1; return i + 4; }
+    if (i + 5 <= n && memcmp(b+i, "false", 5) == 0) { *out = 0; return i + 5; }
+    return -1;
+}
+static int p_is_null(const char *b, int n, int i) {
+    i = p_skip_ws(b, n, i);
+    return i + 4 <= n && memcmp(b+i, "null", 4) == 0;
+}
+static int p_skip_value(const char *b, int n, int i) {
+    i = p_skip_ws(b, n, i);
+    if (i >= n) return -1;
+    char c = b[i];
+    if (c == '"') {
+        i++;
+        while (i < n && b[i] != '"') i++;
+        if (i >= n) return -1;
+        return i + 1;
+    }
+    if (c == '{' || c == '[') {
+        char open = c, close = (c == '{') ? '}' : ']';
+        int depth = 1; i++;
+        while (i < n && depth > 0) {
+            char d = b[i];
+            if (d == '"') {
+                i++;
+                while (i < n && b[i] != '"') i++;
+            } else if (d == open) depth++;
+            else if (d == close) depth--;
+            i++;
+        }
+        if (depth != 0) return -1;
+        return i;
+    }
+    if (c == 't') return i + 4;
+    if (c == 'f') return i + 5;
+    if (c == 'n') return i + 4;
+    while (i < n) {
+        char d = b[i];
+        if (d==','||d=='}'||d==']'||d==' '||d=='\n'||d=='\r'||d=='\t') break;
+        i++;
+    }
+    return i;
+}
+static int p_read_array_raw(const char *b, int n, int i, const char **s, int *sl) {
+    i = p_skip_ws(b, n, i);
+    if (i >= n || b[i] != '[') return -1;
+    int start = i;
+    int end = p_skip_value(b, n, i);
+    if (end < 0) return -1;
+    *s = b + start; *sl = end - start;
+    return end;
+}
+
+/* dispatcher de campos aninhados; retorna nova posição, -2 (skip) ou -1 (erro) */
+typedef int (*kv_fn)(const char *b, int n, const char *k, int kl, int v, Payload *p);
+
+static int for_each_kv(const char *b, int n, int start, kv_fn fn, Payload *p) {
+    int i = p_expect(b, n, start, '{');
+    if (i < 0) return -1;
+    for (;;) {
+        i = p_skip_ws(b, n, i);
+        if (i < n && b[i] == '}') return i + 1;
+        const char *key; int kl;
+        int next = p_read_string(b, n, i, &key, &kl);
+        if (next < 0) return -1;
+        i = p_expect(b, n, next, ':');
+        if (i < 0) return -1;
+        i = p_skip_ws(b, n, i);
+        int consumed = fn(b, n, key, kl, i, p);
+        if (consumed == -1) return -1;
+        if (consumed == -2) { i = p_skip_value(b, n, i); if (i < 0) return -1; }
+        else i = consumed;
+        i = p_skip_ws(b, n, i);
+        if (i < n && b[i] == ',') { i++; continue; }
+        if (i < n && b[i] == '}') return i + 1;
+        return -1;
+    }
+}
+
+#define KEY_IS(s) (kl == (int)sizeof(s)-1 && memcmp(k, s, kl) == 0)
+
+static int tx_kv(const char *b, int n, const char *k, int kl, int v, Payload *p) {
+    if (KEY_IS("amount"))       return p_read_f64(b, n, v, &p->amount);
+    if (KEY_IS("installments")) return p_read_u32(b, n, v, &p->installments);
+    if (KEY_IS("requested_at")) {
+        const char *s; int sl;
+        int e = p_read_string(b, n, v, &s, &sl);
+        if (e < 0) return -1;
+        if (!parse_iso8601(s, sl, &p->requested_at)) return -1;
+        return e;
+    }
+    return -2;
+}
+static int customer_kv(const char *b, int n, const char *k, int kl, int v, Payload *p) {
+    if (KEY_IS("avg_amount"))      return p_read_f64(b, n, v, &p->customer_avg);
+    if (KEY_IS("tx_count_24h"))    return p_read_u32(b, n, v, &p->tx_count_24h);
+    if (KEY_IS("known_merchants")) return p_read_array_raw(b, n, v, &p->known_buf, &p->known_len);
+    return -2;
+}
+static int merchant_kv(const char *b, int n, const char *k, int kl, int v, Payload *p) {
+    if (KEY_IS("id"))         return p_read_string(b, n, v, &p->merchant_id, &p->merchant_id_len);
+    if (KEY_IS("mcc"))        return p_read_string(b, n, v, &p->merchant_mcc, &p->merchant_mcc_len);
+    if (KEY_IS("avg_amount")) return p_read_f64(b, n, v, &p->merchant_avg);
+    return -2;
+}
+static int terminal_kv(const char *b, int n, const char *k, int kl, int v, Payload *p) {
+    if (KEY_IS("is_online"))    return p_read_bool(b, n, v, &p->is_online);
+    if (KEY_IS("card_present")) return p_read_bool(b, n, v, &p->card_present);
+    if (KEY_IS("km_from_home")) return p_read_f64(b, n, v, &p->km_from_home);
+    return -2;
+}
+static int last_tx_kv(const char *b, int n, const char *k, int kl, int v, Payload *p) {
+    if (KEY_IS("timestamp")) {
+        const char *s; int sl;
+        int e = p_read_string(b, n, v, &s, &sl);
+        if (e < 0) return -1;
+        if (!parse_iso8601(s, sl, &p->last_tx_stamp)) return -1;
+        return e;
+    }
+    if (KEY_IS("km_from_current")) return p_read_f64(b, n, v, &p->last_tx_km);
+    return -2;
+}
+static int top_kv(const char *b, int n, const char *k, int kl, int v, Payload *p) {
+    if (KEY_IS("transaction"))  return for_each_kv(b, n, v, tx_kv, p);
+    if (KEY_IS("customer"))     return for_each_kv(b, n, v, customer_kv, p);
+    if (KEY_IS("merchant"))     return for_each_kv(b, n, v, merchant_kv, p);
+    if (KEY_IS("terminal"))     return for_each_kv(b, n, v, terminal_kv, p);
+    if (KEY_IS("last_transaction")) {
+        if (p_is_null(b, n, v)) {
+            p->has_last_tx = 0;
+            return p_skip_value(b, n, v);
+        }
+        p->has_last_tx = 1;
+        return for_each_kv(b, n, v, last_tx_kv, p);
+    }
+    return -2;
+}
+
+static int parse_payload(const char *b, int n, Payload *p) {
+    memset(p, 0, sizeof(*p));
+    return for_each_kv(b, n, 0, top_kv, p) >= 0;
+}
+
+static int merchant_in_known(const char *known, int klen, const char *mid, int mid_len) {
+    if (mid_len <= 0) return 0;
+    int i = 0;
+    while (i < klen) {
+        if (known[i] == '"') {
+            int start = i + 1, j = start;
+            while (j < klen && known[j] != '"') j++;
+            if (j - start == mid_len && memcmp(known + start, mid, (size_t)mid_len) == 0)
+                return 1;
+            i = j + 1;
+        } else i++;
     }
     return 0;
 }
 
-static int skip_str(const char *b, int n, int *p) {
-    if (*p<n && b[*p]=='"') (*p)++;
-    const char *e = memchr(b+*p, '"', n-*p);
-    if (!e) return 0;
-    *p = (int)(e-b)+1; return 1;
-}
+/* Vetorização (vectorize_q) ----------------------------------------------- */
 
-static float scan_f32(const char *b, int n, int *p) {
-    int neg=0;
-    if (*p<n && b[*p]=='-') { neg=1; (*p)++; }
-    double v=0;
-    while (*p<n && b[*p]>='0' && b[*p]<='9') { v=v*10+(b[*p]-'0'); (*p)++; }
-    if (*p<n && b[*p]=='.') {
-        (*p)++; double f=0.1;
-        while (*p<n && b[*p]>='0' && b[*p]<='9') { v+=(b[*p]-'0')*f; f*=0.1; (*p)++; }
-    }
-    if (*p<n && (b[*p]|32)=='e') {
-        (*p)++; int es=1;
-        if (*p<n && b[*p]=='-'){es=-1;(*p)++;} else if(*p<n&&b[*p]=='+')(*p)++;
-        int e=0; while(*p<n&&b[*p]>='0'&&b[*p]<='9'){e=e*10+(b[*p]-'0');(*p)++;}
-        v*=pow(10.0,es*e);
-    }
-    return (float)(neg?-v:v);
-}
+static void vectorize(const Payload *p, int16_t *q) {
+    q[0] = quantize_clamped(p->amount / MAX_AMOUNT);
+    q[1] = quantize_clamped((double)p->installments / MAX_INSTALLMENTS);
 
-static uint32_t scan_u32(const char *b, int n, int *p) {
-    uint32_t v=0;
-    while (*p<n && b[*p]>='0' && b[*p]<='9') { v=v*10+(b[*p]-'0'); (*p)++; }
-    return v;
-}
+    double ratio = p->customer_avg > 0.0 ? p->amount / p->customer_avg : INFINITY;
+    q[2] = quantize_clamped(ratio / AMOUNT_VS_AVG_RATIO);
 
-static int scan_bool(const char *b, int n, int *p) {
-    int r = (*p<n && b[*p]=='t'); *p += r ? 4 : 5; return r;
-}
+    q[3] = quantize((double)p->requested_at.hour / 23.0);
+    q[4] = quantize((double)p->requested_at.weekday / 6.0);
 
-static uint32_t scan_mcc(const char *b, int n, int *p) {
-    if (*p<n && b[*p]=='"') (*p)++;
-    uint32_t v = scan_u32(b,n,p);
-    if (*p<n && b[*p]=='"') (*p)++;
-    return v;
-}
-
-static const char *scan_str(const char *b, int n, int *p, int *slen) {
-    if (*p>=n||b[*p]!='"'){*slen=0;return NULL;}
-    (*p)++;
-    int s=*p;
-    const char *e=memchr(b+*p,'"',n-*p);
-    if(!e){*slen=0;return NULL;}
-    *slen=(int)(e-(b+s)); *p=(int)(e-b)+1;
-    return b+s;
-}
-
-static int scan_iso(const char *b, int n, int *p,
-    uint16_t *y, uint8_t *mo, uint8_t *d, uint8_t *h, uint8_t *mi)
-{
-    if (*p<n && b[*p]=='"') (*p)++;
-    if (n-*p < 16) return 0;
-    const char *s=b+*p;
-    *y  = (uint16_t)((s[0]-'0')*1000+(s[1]-'0')*100+(s[2]-'0')*10+(s[3]-'0'));
-    *mo = (s[5]-'0')*10+(s[6]-'0');
-    *d  = (s[8]-'0')*10+(s[9]-'0');
-    *h  = (s[11]-'0')*10+(s[12]-'0');
-    *mi = (s[14]-'0')*10+(s[15]-'0');
-    *p += 16;
-    const char *e=memchr(b+*p,'"',n-*p);
-    if (e) *p=(int)(e-b)+1;
-    return 1;
-}
-
-static int parse_json(const char *buf, int len, Payload *px) {
-    int p = 0;
-    if (!next_val(buf,len,&p)) return 0;
-    if (!skip_str(buf,len,&p)) return 0;
-    if (!next_val(buf,len,&p)) return 0;
-    if (!next_val(buf,len,&p)) return 0;
-    px->amount = scan_f32(buf,len,&p);
-    if (!next_val(buf,len,&p)) return 0;
-    px->installments = (uint8_t)scan_u32(buf,len,&p);
-    if (!next_val(buf,len,&p)) return 0;
-    uint16_t ry; uint8_t rmo,rd,rh,rmi;
-    if (!scan_iso(buf,len,&p,&ry,&rmo,&rd,&rh,&rmi)) return 0;
-    px->hour = rh;
-    px->dow  = day_of_week(ry,rmo,rd);
-    if (!next_val(buf,len,&p)) return 0;
-    if (!next_val(buf,len,&p)) return 0;
-    px->customer_avg = scan_f32(buf,len,&p);
-    if (!next_val(buf,len,&p)) return 0;
-    px->tx_count_24h = scan_u32(buf,len,&p);
-    if (!next_val(buf,len,&p)) return 0;
-    while (p<len && buf[p]!='[') p++;
-    if (p>=len) return 0;
-    p++;
-    const char *merchant_sl[16]; int merchant_ln[16]; int mc=0;
-    while (p<len && buf[p]!=']') {
-        if (buf[p]=='"') {
-            p++;
-            const char *e=memchr(buf+p,'"',len-p);
-            if (!e) break;
-            if (mc<16){merchant_sl[mc]=buf+p; merchant_ln[mc]=(int)(e-(buf+p)); mc++;}
-            p=(int)(e-buf)+1;
-        } else p++;
-    }
-    if (p<len) p++;
-    if (!next_val(buf,len,&p)) return 0;
-    if (!next_val(buf,len,&p)) return 0;
-    int mid_len;
-    const char *mid = scan_str(buf,len,&p,&mid_len);
-    if (!next_val(buf,len,&p)) return 0;
-    px->mcc = scan_mcc(buf,len,&p);
-    if (!next_val(buf,len,&p)) return 0;
-    px->merchant_avg = scan_f32(buf,len,&p);
-    if (!next_val(buf,len,&p)) return 0;
-    if (!next_val(buf,len,&p)) return 0;
-    px->is_online   = scan_bool(buf,len,&p);
-    if (!next_val(buf,len,&p)) return 0;
-    px->card_present = scan_bool(buf,len,&p);
-    if (!next_val(buf,len,&p)) return 0;
-    px->km_home = scan_f32(buf,len,&p);
-    if (!next_val(buf,len,&p)) return 0;
-    px->has_last_tx = (p<len && buf[p]!='n');
-    if (px->has_last_tx) {
-        if (!next_val(buf,len,&p)) return 0;
-        uint16_t ly; uint8_t lmo,ld,lh,lmi;
-        if (!scan_iso(buf,len,&p,&ly,&lmo,&ld,&lh,&lmi)) return 0;
-        if (!next_val(buf,len,&p)) return 0;
-        px->km_current = scan_f32(buf,len,&p);
-        px->minutes_since_last = minutes_between(ly,lmo,ld,lh,lmi, ry,rmo,rd,rh,rmi);
+    if (p->has_last_tx) {
+        double minutes = (double)(p->requested_at.epoch_min - p->last_tx_stamp.epoch_min);
+        q[5] = quantize_clamped(minutes / MAX_MINUTES);
+        q[6] = quantize_clamped(p->last_tx_km / MAX_KM);
     } else {
-        px->km_current = 0; px->minutes_since_last = 0;
+        q[5] = -(int16_t)SCALE;
+        q[6] = -(int16_t)SCALE;
     }
-    px->is_unknown = 1;
-    if (mid) {
-        for (int i=0; i<mc; i++) {
-            if (merchant_ln[i]==mid_len && memcmp(merchant_sl[i],mid,mid_len)==0) {
-                px->is_unknown=0; break;
+
+    q[7]  = quantize_clamped(p->km_from_home / MAX_KM);
+    q[8]  = quantize_clamped((double)p->tx_count_24h / MAX_TX_COUNT_24H);
+    q[9]  = p->is_online ? (int16_t)SCALE : 0;
+    q[10] = p->card_present ? (int16_t)SCALE : 0;
+    q[11] = merchant_in_known(p->known_buf, p->known_len, p->merchant_id, p->merchant_id_len)
+                ? 0 : (int16_t)SCALE;
+    q[12] = quantize(mcc_risk_lookup(p->merchant_mcc, p->merchant_mcc_len));
+    q[13] = quantize_clamped(p->merchant_avg / MAX_MERCHANT_AVG_AMOUNT);
+    q[14] = 0;
+    q[15] = 0;
+}
+
+/* Busca KNN particionada (index.rs::fraud_count_pair_avx2) ----------------- */
+
+static uint32_t partition_key(const int16_t *v) {
+    uint32_t key = 0;
+    if (v[5] >= 0)  key |= 1u << 0;
+    if (v[9] > 0)   key |= 1u << 1;
+    if (v[10] > 0)  key |= 1u << 2;
+    if (v[11] > 0)  key |= 1u << 3;
+    int16_t mr = v[12];
+    if (mr <= 2047) { /* 0 */ }
+    else if (mr <= 4095) key |= 1u << 4;
+    else if (mr <= 6143) key |= 2u << 4;
+    else                 key |= 3u << 4;
+    if (v[2] > 4096) key |= 1u << 6;
+    if (v[8] > 2048) key |= 1u << 7;
+    return key;
+}
+
+static inline int64_t lower_bound_ptr(const int16_t *q, const int16_t *mn, const int16_t *mx) {
+    __m256i qv = _mm256_loadu_si256((const __m256i *)q);
+    __m256i miv = _mm256_loadu_si256((const __m256i *)mn);
+    __m256i mxv = _mm256_loadu_si256((const __m256i *)mx);
+    __m256i zero = _mm256_setzero_si256();
+    __m256i below = _mm256_max_epi16(_mm256_sub_epi16(miv, qv), zero);
+    __m256i above = _mm256_max_epi16(_mm256_sub_epi16(qv, mxv), zero);
+    __m256i gap = _mm256_max_epi16(below, above);
+    __m256i sq = _mm256_madd_epi16(gap, gap);
+    int32_t v[LANES];
+    _mm256_storeu_si256((__m256i *)v, sq);
+    return (int64_t)v[0]+v[1]+v[2]+v[3]+v[4]+v[5]+v[6]+v[7];
+}
+
+static inline int64_t lower_bound_partition(uint32_t part, const int16_t *q) {
+    const uint8_t *base = g_parts + (size_t)part * PART_SIZE;
+    return lower_bound_ptr(q, (const int16_t *)(base + 12), (const int16_t *)(base + 44));
+}
+static inline int64_t lower_bound_node(uint32_t node, const int16_t *q) {
+    const uint8_t *base = g_nodes + (size_t)node * NODE_SIZE;
+    return lower_bound_ptr(q, (const int16_t *)(base + 16), (const int16_t *)(base + 48));
+}
+
+static inline void distance_pair_block8(int32_t block_idx, const __m256i *q_pairs, int64_t *out) {
+    const int16_t *base = g_vectors + (size_t)block_idx * DIMS * LANES;
+    __m256i acc = _mm256_setzero_si256();
+    for (int p = 0; p < IVF_PAIRS; p++) {
+        __m256i packed = _mm256_loadu_si256((const __m256i *)(base + (size_t)p * LANES * 2));
+        __m256i diff = _mm256_sub_epi16(q_pairs[p], packed);
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(diff, diff));
+    }
+    uint32_t v[LANES];
+    _mm256_storeu_si256((__m256i *)v, acc);
+    for (int i = 0; i < LANES; i++) out[i] = (int64_t)v[i];
+}
+
+static inline void insert_best(int64_t dist, uint8_t label, int64_t *bd, uint8_t *bl) {
+    if (dist >= bd[K-1]) return;
+    int pos = K - 1;
+    while (pos > 0 && dist < bd[pos-1]) { bd[pos] = bd[pos-1]; bl[pos] = bl[pos-1]; pos--; }
+    bd[pos] = dist; bl[pos] = label;
+}
+static inline uint8_t sum_labels(const uint8_t *bl) {
+    uint8_t n = 0;
+    for (int i = 0; i < K; i++) n += bl[i];
+    return n;
+}
+static inline int early_done(const int64_t *bd) { return bd[K-1] <= EARLY_DISTANCE_LIMIT; }
+
+static inline void node_meta(uint32_t node, int32_t *left, int32_t *right,
+                             int32_t *start, int32_t *len) {
+    const uint8_t *base = g_nodes + (size_t)node * NODE_SIZE;
+    *left = rd_i32(base); *right = rd_i32(base + 4);
+    *start = rd_i32(base + 8); *len = rd_i32(base + 12);
+}
+
+static int scan_leaf(int32_t start_block, int32_t len, const __m256i *q_pairs,
+                     int64_t *bd, uint8_t *bl) {
+    int blocks = (len + LANES - 1) / LANES;
+    for (int b = 0; b < blocks; b++) {
+        int32_t block_idx = start_block + b;
+        int64_t dists[LANES];
+        distance_pair_block8(block_idx, q_pairs, dists);
+        int lane_count = len - b * LANES;
+        if (lane_count > LANES) lane_count = LANES;
+        const uint8_t *lab = g_labels + (size_t)block_idx * LANES;
+        for (int lane = 0; lane < lane_count; lane++) {
+            if (dists[lane] < bd[K-1]) insert_best(dists[lane], lab[lane], bd, bl);
+        }
+        if (early_done(bd)) return 1;
+    }
+    return 0;
+}
+
+static int search_node(int32_t root, int64_t root_bound, const int16_t *q,
+                       const __m256i *q_pairs, int64_t *bd, uint8_t *bl) {
+    if (root < 0 || (uint32_t)root >= g_node_count) return 0;
+    int32_t stack_node[128];
+    int64_t stack_bound[128];
+    int sp = 0;
+    int32_t cur = root;
+    int64_t cur_bound = root_bound;
+
+    for (;;) {
+        if (cur_bound < bd[K-1]) {
+            int32_t left, right, start, len;
+            node_meta((uint32_t)cur, &left, &right, &start, &len);
+            if (left < 0) {
+                if (scan_leaf(start, len, q_pairs, bd, bl)) return 1;
+            } else {
+                int64_t lb = lower_bound_node((uint32_t)left, q);
+                int64_t rb = lower_bound_node((uint32_t)right, q);
+                int32_t near, far; int64_t nb, fb;
+                if (lb <= rb) { near = left; nb = lb; far = right; fb = rb; }
+                else          { near = right; nb = rb; far = left; fb = lb; }
+                if (fb < bd[K-1] && sp < 128) {
+                    stack_node[sp] = far; stack_bound[sp] = fb; sp++;
+                }
+                cur = near; cur_bound = nb;
+                continue;
             }
         }
+        if (sp == 0) break;
+        sp--;
+        cur = stack_node[sp];
+        cur_bound = stack_bound[sp];
     }
-    return 1;
+    return early_done(bd);
 }
 
-/* Payload vectorization --------------------------------------------------- */
-
-static inline float round4(float x) { return roundf(x*10000.f)*0.0001f; }
-static inline float clamp01(float x) {
-    if (x<0.f) x=0.f; else if (x>1.f) x=1.f;
-    return round4(x);
+typedef struct { int32_t part; int64_t lb; } Probe;
+static int cmp_probe(const void *a, const void *b) {
+    int64_t la = ((const Probe *)a)->lb, lb = ((const Probe *)b)->lb;
+    return (la > lb) - (la < lb);
 }
 
-static void vectorize(const Payload *px, float *v) {
-    v[0]  = clamp01(px->amount / 10000.f);
-    v[1]  = clamp01((float)px->installments / 12.f);
-    float ratio = px->customer_avg > 0.f
-        ? (px->amount / px->customer_avg) / 10.f : 1.f;
-    v[2]  = clamp01(ratio);
-    v[3]  = round4((float)px->hour / 23.f);
-    v[4]  = round4((float)px->dow  / 6.f);
-    if (px->has_last_tx) {
-        v[5] = clamp01((float)px->minutes_since_last / 1440.f);
-        v[6] = clamp01(px->km_current / 1000.f);
-    } else {
-        v[5] = -1.f; v[6] = -1.f;  /* sentinela: sem transação anterior */
+static uint8_t fraud_count(const int16_t *q) {
+    int64_t bd[K];
+    uint8_t bl[K];
+    for (int i = 0; i < K; i++) { bd[i] = INT64_MAX; bl[i] = 0; }
+
+    __m256i q_pairs[IVF_PAIRS];
+    for (int p = 0; p < IVF_PAIRS; p++) {
+        uint32_t lo = (uint16_t)q[p*2];
+        uint32_t hi = (uint16_t)q[p*2 + 1];
+        q_pairs[p] = _mm256_set1_epi32((int)(lo | (hi << 16)));
     }
-    v[7]  = clamp01(px->km_home / 1000.f);
-    v[8]  = clamp01((float)px->tx_count_24h / 20.f);
-    v[9]  = px->is_online   ? 1.f : 0.f;
-    v[10] = px->card_present? 1.f : 0.f;
-    v[11] = px->is_unknown  ? 1.f : 0.f;
-    v[12] = mcc_risk(px->mcc);
-    v[13] = clamp01(px->merchant_avg / 10000.f);
+
+    uint32_t key = partition_key(q);
+    int32_t primary = g_part_by_key[key & 0xff];
+    if (primary >= 0) {
+        int32_t root = rd_i32(g_parts + (size_t)primary * PART_SIZE + 4);
+        if (search_node(root, 0, q, q_pairs, bd, bl))
+            return sum_labels(bl);
+    }
+
+    Probe probes[256];
+    int np = 0;
+    for (int32_t p = 0; p < (int32_t)g_part_count; p++) {
+        if (p == primary) continue;
+        int64_t lb = lower_bound_partition((uint32_t)p, q);
+        if (lb >= bd[K-1]) continue;
+        probes[np].part = p; probes[np].lb = lb; np++;
+    }
+    qsort(probes, (size_t)np, sizeof(Probe), cmp_probe);
+
+    for (int i = 0; i < np; i++) {
+        if (probes[i].lb >= bd[K-1]) break;
+        int32_t root = rd_i32(g_parts + (size_t)probes[i].part * PART_SIZE + 4);
+        if (search_node(root, probes[i].lb, q, q_pairs, bd, bl)) break;
+    }
+    return sum_labels(bl);
 }
 
-/* IVF/KNN search ---------------------------------------------------------- */
+/* Scoring de requisição --------------------------------------------------- */
 
-static void compute_centroid_dists(const float *q, const float *ct, int k, float *dists) {
-    {
-        const float *cp = ct;
-        __m256 qd = _mm256_set1_ps(q[0]);
-        int ci;
-        for (ci=0; ci+16<=k; ci+=16) {
-            __m256 d0=_mm256_sub_ps(_mm256_load_ps(cp+ci),   qd);
-            __m256 d1=_mm256_sub_ps(_mm256_load_ps(cp+ci+8), qd);
-            _mm256_store_ps(dists+ci,   _mm256_mul_ps(d0,d0));
-            _mm256_store_ps(dists+ci+8, _mm256_mul_ps(d1,d1));
-        }
-        for (; ci<k; ci++) { float d=cp[ci]-q[0]; dists[ci]=d*d; }
-    }
-    for (int d=1; d<DIMS; d++) {
-        const float *cp = ct + d*k;
-        __m256 qd = _mm256_set1_ps(q[d]);
-        int ci;
-        for (ci=0; ci+16<=k; ci+=16) {
-            __m256 cv0=_mm256_load_ps(cp+ci);    __m256 cv1=_mm256_load_ps(cp+ci+8);
-            __m256 d0 =_mm256_sub_ps(cv0,qd);    __m256 d1 =_mm256_sub_ps(cv1,qd);
-            __m256 a0 =_mm256_load_ps(dists+ci); __m256 a1 =_mm256_load_ps(dists+ci+8);
-            _mm256_store_ps(dists+ci,   _mm256_fmadd_ps(d0,d0,a0));
-            _mm256_store_ps(dists+ci+8, _mm256_fmadd_ps(d1,d1,a1));
-        }
-        for (; ci<k; ci++) { float dd=cp[ci]-q[d]; dists[ci]+=dd*dd; }
-    }
-}
-
-static void top_n(const float *dists, int k, int n, int *out) {
-    float td[FULL_NPROBE]; int ti[FULL_NPROBE];
-    for (int i=0;i<n;i++){td[i]=FLT_MAX;ti[i]=0;}
-
-    int ci = 0;
-    for (; ci+8<=k; ci+=8) {
-        __m256 d   = _mm256_load_ps(dists+ci);
-        __m256 thr = _mm256_set1_ps(td[n-1]);
-        int mask   = _mm256_movemask_ps(_mm256_cmp_ps(d, thr, _CMP_LT_OQ));
-        if (!mask) continue;
-
-        float buf[8];
-        _mm256_storeu_ps(buf, d);
-
-        while (mask) {
-            int s = __builtin_ctz(mask);
-            mask &= mask - 1;
-            float di = buf[s];
-            if (di >= td[n-1]) continue;
-            int pos = n-1;
-            while (pos>0 && di<td[pos-1]) pos--;
-            for (int j=n-1;j>pos;j--){td[j]=td[j-1];ti[j]=ti[j-1];}
-            td[pos] = di;
-            ti[pos] = ci + s;
-        }
-    }
-    for (; ci<k; ci++) {
-        float di = dists[ci];
-        if (di >= td[n-1]) continue;
-        int pos = n-1;
-        while (pos>0 && di<td[pos-1]) pos--;
-        for (int j=n-1;j>pos;j--){td[j]=td[j-1];ti[j]=ti[j-1];}
-        td[pos] = di;
-        ti[pos] = ci;
-    }
-    memcpy(out, ti, n*sizeof(int));
-}
-
-static void scan_cluster(
-    const __m256 *qv,
-    uint32_t bs, uint32_t be,
-    float top5d[5], uint8_t top5l[5], int *wi)
-{
-    __m256 scale = _mm256_set1_ps(VECTOR_SCALE);
-
-#define DIM_PAIR(D) { \
-    const int16_t *row0=block+(D)*BLOCK_VECS; \
-    const int16_t *row1=block+((D)+1)*BLOCK_VECS; \
-    __m128i r0lo=_mm_load_si128((__m128i*)row0); \
-    __m128i r0hi=_mm_load_si128((__m128i*)(row0+8)); \
-    __m128i r1lo=_mm_load_si128((__m128i*)row1); \
-    __m128i r1hi=_mm_load_si128((__m128i*)(row1+8)); \
-    __m256 v0lo=_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(r0lo)),scale); \
-    __m256 v0hi=_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(r0hi)),scale); \
-    __m256 v1lo=_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(r1lo)),scale); \
-    __m256 v1hi=_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(r1hi)),scale); \
-    __m256 d0lo=_mm256_sub_ps(v0lo,qv[D]);     \
-    __m256 d1lo=_mm256_sub_ps(v1lo,qv[(D)+1]); \
-    __m256 d0hi=_mm256_sub_ps(v0hi,qv[D]);     \
-    __m256 d1hi=_mm256_sub_ps(v1hi,qv[(D)+1]); \
-    alo=_mm256_fmadd_ps(d0lo,d0lo,alo); \
-    blo=_mm256_fmadd_ps(d1lo,d1lo,blo); \
-    ahi=_mm256_fmadd_ps(d0hi,d0hi,ahi); \
-    bhi=_mm256_fmadd_ps(d1hi,d1hi,bhi); \
-}
-
-    for (uint32_t bi=bs; bi<be; bi++) {
-        if (bi+8<be) {
-            const char *nxt=(const char*)(g_blocks+(bi+8)*(size_t)DIMS*BLOCK_VECS);
-            __builtin_prefetch(nxt,     0, 3);
-            __builtin_prefetch(nxt+ 64, 0, 3);
-            __builtin_prefetch(nxt+128, 0, 3);
-            __builtin_prefetch(nxt+192, 0, 3);
-            __builtin_prefetch(nxt+256, 0, 3);
-            __builtin_prefetch(nxt+320, 0, 3);
-            __builtin_prefetch(nxt+384, 0, 3);
-        }
-
-        const int16_t *block=g_blocks+bi*(size_t)DIMS*BLOCK_VECS;
-        __m256 thresh=_mm256_set1_ps(top5d[*wi]);
-
-        __m256 alo=_mm256_setzero_ps(), blo=_mm256_setzero_ps();
-        __m256 ahi=_mm256_setzero_ps(), bhi=_mm256_setzero_ps();
-
-        DIM_PAIR(0); DIM_PAIR(2); DIM_PAIR(4); DIM_PAIR(6);
-
-        __m256 plo=_mm256_add_ps(alo,blo);
-        __m256 phi=_mm256_add_ps(ahi,bhi);
-        if (!_mm256_movemask_ps(_mm256_cmp_ps(plo,thresh,_CMP_LT_OQ)) &&
-            !_mm256_movemask_ps(_mm256_cmp_ps(phi,thresh,_CMP_LT_OQ))) continue;
-
-        DIM_PAIR(8); DIM_PAIR(10); DIM_PAIR(12);
-
-        __m256 acclo=_mm256_add_ps(alo,blo);
-        __m256 acchi=_mm256_add_ps(ahi,bhi);
-        int masklo=_mm256_movemask_ps(_mm256_cmp_ps(acclo,thresh,_CMP_LT_OQ));
-        int maskhi=_mm256_movemask_ps(_mm256_cmp_ps(acchi,thresh,_CMP_LT_OQ));
-        if (!masklo && !maskhi) continue;
-
-        float dlo[8]; _mm256_storeu_ps(dlo,acclo);
-        float dhi[8]; _mm256_storeu_ps(dhi,acchi);
-        uint32_t lb=bi*BLOCK_VECS;
-
-        while (masklo) {
-            int s=__builtin_ctz(masklo); masklo&=masklo-1;
-            float di=dlo[s];
-            if (di<top5d[*wi]) {
-                top5d[*wi]=di; top5l[*wi]=g_labels[lb+s];
-                int nwi=0; float nwv=top5d[0];
-                for (int j=1;j<5;j++) if(top5d[j]>nwv){nwv=top5d[j];nwi=j;}
-                *wi=nwi;
-            }
-        }
-        while (maskhi) {
-            int s=__builtin_ctz(maskhi); maskhi&=maskhi-1;
-            float di=dhi[s];
-            if (di<top5d[*wi]) {
-                top5d[*wi]=di; top5l[*wi]=g_labels[lb+8+s];
-                int nwi=0; float nwv=top5d[0];
-                for (int j=1;j<5;j++) if(top5d[j]>nwv){nwv=top5d[j];nwi=j;}
-                *wi=nwi;
-            }
-        }
-    }
-#undef DIM_PAIR
-}
-
-static uint8_t knn5_search(const float *q) {
-    compute_centroid_dists(q, g_ct, g_k, g_dists);
-
-    int probes_fast[FAST_NPROBE];
-    top_n(g_dists, g_k, FAST_NPROBE, probes_fast);
-
-    __m256 qv[DIMS];
-    for (int d=0;d<DIMS;d++) qv[d]=_mm256_set1_ps(q[d]);
-
-    float top5d[5]={FLT_MAX,FLT_MAX,FLT_MAX,FLT_MAX,FLT_MAX};
-    uint8_t top5l[5]={0};
-    int wi=0;
-
-    for (int pi=0; pi<FAST_NPROBE; pi++) {
-        int ci=probes_fast[pi];
-        scan_cluster(qv, g_offsets[ci], g_offsets[ci+1], top5d, top5l, &wi);
-    }
-    uint8_t fc=0;
-    for (int i=0;i<5;i++) fc+=top5l[i];
-    if (fc>=2 && fc<=4) {
-        int probes_full[FULL_NPROBE];
-        top_n(g_dists, g_k, FULL_NPROBE, probes_full);
-        for (int pi=FAST_NPROBE; pi<FULL_NPROBE; pi++) {
-            int ci=probes_full[pi];
-            scan_cluster(qv, g_offsets[ci], g_offsets[ci+1], top5d, top5l, &wi);
-        }
-        fc=0;
-        for (int i=0;i<5;i++) fc+=top5l[i];
-    }
-    return fc;
-}
-
-/* Request scoring --------------------------------------------------------- */
-
-static const char *process_fraud(const char *body, int len) {
+static uint8_t process_fraud(const char *body, int len) {
     Payload px;
-    if (!parse_json(body, len, &px)) return RESP_FRAUD[0];
-    float q[DIMS];
+    if (!parse_payload(body, len, &px)) return RESP_FALLBACK_IDX;
+    int16_t q[STORE_DIM];
     vectorize(&px, q);
-    uint8_t fc = knn5_search(q);
-    return RESP_FRAUD[fc < 6 ? fc : 5];
+    uint8_t fc = fraud_count(q);
+    return fc < 6 ? fc : 5;
 }
 
-/* Epoll event and connection state --------------------------------------- */
+/* Estado de conexão / epoll ----------------------------------------------- */
 
 typedef enum {
     EV_CTRL_LISTENER = 1,
@@ -551,9 +685,7 @@ typedef enum {
     EV_CLIENT        = 3,
 } EvKind;
 
-typedef struct EventTag {
-    int kind;
-} EventTag;
+typedef struct EventTag { int kind; } EventTag;
 
 typedef struct Conn {
     int  kind;
@@ -562,10 +694,7 @@ typedef struct Conn {
     char buf[RX_BUF_SZ];
 } Conn;
 
-typedef struct CtrlConn {
-    int kind;
-    int fd;
-} CtrlConn;
+typedef struct CtrlConn { int kind; int fd; } CtrlConn;
 
 #define MAX_CTRL_CONNS 16
 
@@ -577,8 +706,6 @@ static int       ctrl_free_stk[MAX_CTRL_CONNS];
 static int       ctrl_free_top;
 static EventTag  ctrl_listener_tag = { EV_CTRL_LISTENER };
 
-/* File descriptor setup --------------------------------------------------- */
-
 static int set_fd_nonblock_cloexec(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
@@ -587,14 +714,12 @@ static int set_fd_nonblock_cloexec(int fd) {
     return 0;
 }
 
-/* Connection pools -------------------------------------------------------- */
-
 static void conn_pool_init(void) {
     conn_free_top = MAX_CONNS;
-    for (int i=0;i<MAX_CONNS;i++){
-        conn_pool[i].kind=EV_CLIENT;
-        conn_pool[i].fd=-1;
-        conn_free_stk[i]=i;
+    for (int i = 0; i < MAX_CONNS; i++) {
+        conn_pool[i].kind = EV_CLIENT;
+        conn_pool[i].fd = -1;
+        conn_free_stk[i] = i;
     }
 }
 static Conn *conn_alloc(void) {
@@ -604,8 +729,8 @@ static Conn *conn_alloc(void) {
     return c;
 }
 static void conn_release(Conn *c) {
-    c->fd=-1; c->head=c->tail=0;
-    conn_free_stk[conn_free_top++]=(int)(c-conn_pool);
+    c->fd = -1; c->head = c->tail = 0;
+    conn_free_stk[conn_free_top++] = (int)(c - conn_pool);
 }
 static void conn_close(Conn *c, int efd) {
     if (c->fd >= 0) {
@@ -617,16 +742,16 @@ static void conn_close(Conn *c, int efd) {
 
 static void ctrl_pool_init(void) {
     ctrl_free_top = MAX_CTRL_CONNS;
-    for (int i=0;i<MAX_CTRL_CONNS;i++){
-        ctrl_pool[i].kind=EV_CTRL_CONN;
-        ctrl_pool[i].fd=-1;
-        ctrl_free_stk[i]=i;
+    for (int i = 0; i < MAX_CTRL_CONNS; i++) {
+        ctrl_pool[i].kind = EV_CTRL_CONN;
+        ctrl_pool[i].fd = -1;
+        ctrl_free_stk[i] = i;
     }
 }
 static CtrlConn *ctrl_alloc(void) {
     if (!ctrl_free_top) return NULL;
-    CtrlConn *c=&ctrl_pool[ctrl_free_stk[--ctrl_free_top]];
-    c->kind=EV_CTRL_CONN;
+    CtrlConn *c = &ctrl_pool[ctrl_free_stk[--ctrl_free_top]];
+    c->kind = EV_CTRL_CONN;
     return c;
 }
 static void ctrl_close(CtrlConn *c, int efd) {
@@ -634,82 +759,95 @@ static void ctrl_close(CtrlConn *c, int efd) {
         epoll_ctl(efd, EPOLL_CTL_DEL, c->fd, NULL);
         close(c->fd);
     }
-    c->fd=-1;
-    ctrl_free_stk[ctrl_free_top++]=(int)(c-ctrl_pool);
+    c->fd = -1;
+    ctrl_free_stk[ctrl_free_top++] = (int)(c - ctrl_pool);
 }
 
-/* HTTP request handling --------------------------------------------------- */
+/* HTTP ------------------------------------------------------------------- */
 
 static int parse_content_length(const char *buf, int hlen) {
-    const char *key="content-length:";
-    for (int i=0; i<=hlen-15; i++) {
-        if ((buf[i]|32)!='c') continue;
-        int ok=1;
-        for (int j=1;j<15;j++) if ((buf[i+j]|32)!=key[j]){ok=0;break;}
+    const char *key = "content-length:";
+    for (int i = 0; i <= hlen - 15; i++) {
+        if ((buf[i] | 32) != 'c') continue;
+        int ok = 1;
+        for (int j = 1; j < 15; j++) if ((buf[i+j] | 32) != key[j]) { ok = 0; break; }
         if (!ok) continue;
-        int p=i+15;
-        while (p<hlen&&(buf[p]==' '||buf[p]=='\t')) p++;
-        int v=0;
-        while (p<hlen&&buf[p]>='0'&&buf[p]<='9'){v=v*10+(buf[p]-'0');p++;}
+        int p = i + 15;
+        while (p < hlen && (buf[p]==' '||buf[p]=='\t')) p++;
+        int v = 0;
+        while (p < hlen && buf[p]>='0' && buf[p]<='9') { v = v*10 + (buf[p]-'0'); p++; }
         return v;
-    }
-    return 0;
-}
-
-static inline int path_eq(const char *rest, int rlen, const char *path, int plen) {
-    if (rlen < plen+1) return 0;
-    if (memcmp(rest,path,plen)!=0) return 0;
-    char nx=rest[plen];
-    return nx==' '||nx=='?';
-}
-
-static int handle_req(const char *buf, int len, struct iovec *iov) {
-    if (len<16) return 0;
-    const char *he=(const char*)memmem(buf,len,"\r\n\r\n",4);
-    if (!he) return 0;
-    int hlen=(int)(he-buf);
-
-    if (memcmp(buf,"POST ",5)==0) {
-        const char *rest=buf+5; int rlen=hlen-5;
-        if (path_eq(rest,rlen,"/fraud-score",12)) {
-            int cl=parse_content_length(buf,hlen);
-            int body_start=hlen+4, body_end=body_start+cl;
-            if (len<body_end) return 0;
-            const char *resp=process_fraud(buf+body_start,cl);
-            iov->iov_base=(void*)resp;
-            iov->iov_len=RESP_FRAUD_LEN[0];
-            for (int i=0;i<6;i++) if (resp==RESP_FRAUD[i]){iov->iov_len=RESP_FRAUD_LEN[i];break;}
-            return body_end;
-        }
-        iov->iov_base=(void*)RESP_NOT_FOUND;
-        iov->iov_len=sizeof(RESP_NOT_FOUND)-1;
-        return hlen+4;
-    }
-    if (memcmp(buf,"GET ",4)==0) {
-        const char *rest=buf+4; int rlen=hlen-4;
-        if (path_eq(rest,rlen,"/ready",6)) {
-            iov->iov_base=(void*)RESP_READY;
-            iov->iov_len=sizeof(RESP_READY)-1;
-            return hlen+4;
-        }
-        iov->iov_base=(void*)RESP_NOT_FOUND;
-        iov->iov_len=sizeof(RESP_NOT_FOUND)-1;
-        return hlen+4;
     }
     return -1;
 }
 
-/* Client IO --------------------------------------------------------------- */
+static inline int path_eq(const char *rest, int rlen, const char *path, int plen) {
+    if (rlen < plen + 1) return 0;
+    if (memcmp(rest, path, (size_t)plen) != 0) return 0;
+    char nx = rest[plen];
+    return nx == ' ' || nx == '?';
+}
+
+/*
+ * Sempre responde 200. Retorna nº de bytes consumidos do buffer e preenche
+ * iov, ou 0 se precisa de mais dados.
+ */
+static int handle_req(const char *buf, int len, struct iovec *iov) {
+    const char *he = (const char *)memmem(buf, (size_t)len, "\r\n\r\n", 4);
+    if (!he) {
+        if (len > MAX_REQ_HEAD) {   /* cabeçalho gigante -> fallback, descarta tudo */
+            iov->iov_base = (void *)RESP_FRAUD[RESP_FALLBACK_IDX];
+            iov->iov_len = RESP_FRAUD_LEN[RESP_FALLBACK_IDX];
+            return len;
+        }
+        return 0;
+    }
+    int hlen = (int)(he - buf);
+    int body_start = hlen + 4;
+
+    if (memcmp(buf, "POST ", 5) == 0) {
+        const char *rest = buf + 5; int rlen = hlen - 5;
+        if (path_eq(rest, rlen, "/fraud-score", 12)) {
+            int cl = parse_content_length(buf, hlen);
+            if (cl < 0 || cl > MAX_BODY) {
+                iov->iov_base = (void *)RESP_FRAUD[RESP_FALLBACK_IDX];
+                iov->iov_len = RESP_FRAUD_LEN[RESP_FALLBACK_IDX];
+                return len;
+            }
+            int body_end = body_start + cl;
+            if (len < body_end) return 0;
+            uint8_t fc = process_fraud(buf + body_start, cl);
+            iov->iov_base = (void *)RESP_FRAUD[fc];
+            iov->iov_len = RESP_FRAUD_LEN[fc];
+            return body_end;
+        }
+        iov->iov_base = (void *)RESP_FRAUD[RESP_FALLBACK_IDX];
+        iov->iov_len = RESP_FRAUD_LEN[RESP_FALLBACK_IDX];
+        return body_start;
+    }
+    if (memcmp(buf, "GET ", 4) == 0) {
+        const char *rest = buf + 4; int rlen = hlen - 4;
+        if (path_eq(rest, rlen, "/ready", 6)) {
+            iov->iov_base = (void *)RESP_READY;
+            iov->iov_len = sizeof(RESP_READY) - 1;
+            return body_start;
+        }
+        iov->iov_base = (void *)RESP_FRAUD[RESP_FALLBACK_IDX];
+        iov->iov_len = RESP_FRAUD_LEN[RESP_FALLBACK_IDX];
+        return body_start;
+    }
+    /* método desconhecido -> fallback, descarta o head */
+    iov->iov_base = (void *)RESP_FRAUD[RESP_FALLBACK_IDX];
+    iov->iov_len = RESP_FRAUD_LEN[RESP_FALLBACK_IDX];
+    return body_start;
+}
 
 static int send_iov_all(int fd, struct iovec *iov, int niov) {
     while (niov > 0) {
         ssize_t n = writev(fd, iov, niov);
-
         if (n > 0) {
             while (niov > 0 && n >= (ssize_t)iov[0].iov_len) {
-                n -= (ssize_t)iov[0].iov_len;
-                iov++;
-                niov--;
+                n -= (ssize_t)iov[0].iov_len; iov++; niov--;
             }
             if (niov > 0 && n > 0) {
                 iov[0].iov_base = (char *)iov[0].iov_base + n;
@@ -717,11 +855,7 @@ static int send_iov_all(int fd, struct iovec *iov, int niov) {
             }
             continue;
         }
-
         if (n < 0 && errno == EINTR) continue;
-
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return -1;
-
         return -1;
     }
     return 0;
@@ -729,50 +863,40 @@ static int send_iov_all(int fd, struct iovec *iov, int niov) {
 
 static void handle_conn(Conn *c, int efd) {
     for (;;) {
-        int space=RX_BUF_SZ-c->tail;
-        if (space==0) {
-            if (c->head==0){conn_close(c,efd);return;}
-            int keep=c->tail-c->head;
-            if(keep>0) memmove(c->buf,c->buf+c->head,keep);
-            c->tail=keep; c->head=0; space=RX_BUF_SZ-c->tail;
+        int space = RX_BUF_SZ - c->tail;
+        if (space == 0) {
+            if (c->head == 0) { conn_close(c, efd); return; }
+            int keep = c->tail - c->head;
+            if (keep > 0) memmove(c->buf, c->buf + c->head, (size_t)keep);
+            c->tail = keep; c->head = 0; space = RX_BUF_SZ - c->tail;
         }
-        int n=(int)recv(c->fd,c->buf+c->tail,space,MSG_DONTWAIT);
-        if (n<0){if(errno==EAGAIN||errno==EWOULDBLOCK)break;conn_close(c,efd);return;}
-        if (n==0){conn_close(c,efd);return;}
-        c->tail+=n;
-        if (n<space) break;
+        int n = (int)recv(c->fd, c->buf + c->tail, (size_t)space, MSG_DONTWAIT);
+        if (n < 0) { if (errno==EAGAIN||errno==EWOULDBLOCK) break; conn_close(c, efd); return; }
+        if (n == 0) { conn_close(c, efd); return; }
+        c->tail += n;
+        if (n < space) break;
     }
 
     struct iovec iovs[MAX_IOVECS];
-    int niov=0, bad=0;
+    int niov = 0;
 
-    while (c->head<c->tail && niov<MAX_IOVECS) {
+    while (c->head < c->tail && niov < MAX_IOVECS) {
         struct iovec iv;
-        int consumed=handle_req(c->buf+c->head, c->tail-c->head, &iv);
-        if (consumed==0) break;
-        if (consumed<0) {
-            iovs[niov].iov_base=(void*)RESP_BAD_REQ;
-            iovs[niov].iov_len=sizeof(RESP_BAD_REQ)-1;
-            niov++; bad=1; break;
-        }
-        if (iv.iov_base == (void*)RESP_NOT_FOUND) bad=1;
-        iovs[niov++]=iv;
-        c->head+=consumed;
+        int consumed = handle_req(c->buf + c->head, c->tail - c->head, &iv);
+        if (consumed == 0) break;
+        iovs[niov++] = iv;
+        c->head += consumed;
     }
 
-    if (niov>0) {
-        if (send_iov_all(c->fd, iovs, niov) < 0) {
-            conn_close(c,efd);
-            return;
-        }
+    if (niov > 0) {
+        if (send_iov_all(c->fd, iovs, niov) < 0) { conn_close(c, efd); return; }
     }
-    if (bad){conn_close(c,efd);return;}
 
-    if (c->head==c->tail){c->head=c->tail=0;}
-    else if (c->head>RX_BUF_SZ/2){
-        int k=c->tail-c->head;
-        memmove(c->buf,c->buf+c->head,k);
-        c->tail=k; c->head=0;
+    if (c->head == c->tail) { c->head = c->tail = 0; }
+    else if (c->head > RX_BUF_SZ / 2) {
+        int k = c->tail - c->head;
+        memmove(c->buf, c->buf + c->head, (size_t)k);
+        c->tail = k; c->head = 0;
     }
 }
 
@@ -780,64 +904,42 @@ static Conn *register_client_fd(int fd, int efd) {
 #ifndef RINHA_ASSUME_PASSED_FD_FLAGS
     set_fd_nonblock_cloexec(fd);
 #endif
-
     Conn *nc = conn_alloc();
-    if (!nc) {
-        close(fd);
-        return NULL;
-    }
-
-    nc->fd = fd;
-    nc->head = nc->tail = 0;
-
-    struct epoll_event ev = {
-        .events = EPOLLIN | EPOLLRDHUP | EPOLLET,
-        .data.ptr = nc
-    };
-
+    if (!nc) { close(fd); return NULL; }
+    nc->fd = fd; nc->head = nc->tail = 0;
+    struct epoll_event ev = { .events = EPOLLIN | EPOLLRDHUP | EPOLLET, .data.ptr = nc };
     if (epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-        close(fd);
-        conn_release(nc);
-        return NULL;
+        close(fd); conn_release(nc); return NULL;
     }
-
     return nc;
 }
 
-/* Control socket FD intake ----------------------------------------------- */
+/* Intake de FDs no socket de controle ------------------------------------- */
 
 static int recv_one_passed_fd(int sock) {
     char byte;
-    struct iovec iov={.iov_base=&byte,.iov_len=1};
-    union {
-        char buf[CMSG_SPACE(sizeof(int))];
-        struct cmsghdr align;
-    } control;
-    memset(&control,0,sizeof(control));
+    struct iovec iov = { .iov_base = &byte, .iov_len = 1 };
+    union { char buf[CMSG_SPACE(sizeof(int))]; struct cmsghdr align; } control;
+    memset(&control, 0, sizeof(control));
 
     struct msghdr msg;
-    memset(&msg,0,sizeof(msg));
-    msg.msg_iov=&iov;
-    msg.msg_iovlen=1;
-    msg.msg_control=control.buf;
-    msg.msg_controllen=sizeof(control.buf);
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov; msg.msg_iovlen = 1;
+    msg.msg_control = control.buf; msg.msg_controllen = sizeof(control.buf);
 
     ssize_t n;
     for (;;) {
-        n=recvmsg(sock,&msg,MSG_DONTWAIT|MSG_CMSG_CLOEXEC);
+        n = recvmsg(sock, &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
         if (n < 0 && errno == EINTR) continue;
         break;
     }
-    if (n < 0) {
-        if (errno==EAGAIN||errno==EWOULDBLOCK) return -2;
-        return -1;
-    }
+    if (n < 0) { if (errno==EAGAIN||errno==EWOULDBLOCK) return -2; return -1; }
     if (n == 0) return -1;
 
-    for (struct cmsghdr *cmsg=CMSG_FIRSTHDR(&msg); cmsg; cmsg=CMSG_NXTHDR(&msg,cmsg)) {
-        if (cmsg->cmsg_level==SOL_SOCKET && cmsg->cmsg_type==SCM_RIGHTS) {
-            int fd=-1;
-            memcpy(&fd,CMSG_DATA(cmsg),sizeof(fd));
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+            int fd = -1;
+            memcpy(&fd, CMSG_DATA(cmsg), sizeof(fd));
             return fd;
         }
     }
@@ -847,168 +949,138 @@ static int recv_one_passed_fd(int sock) {
 static int drain_control_fds(CtrlConn *cc, int efd) {
     for (;;) {
         int fd = recv_one_passed_fd(cc->fd);
-
-        if (fd == -2) {
-            return 0;
-        }
-
-        if (fd < 0) {
-            return -1;
-        }
-
+        if (fd == -2) return 0;
+        if (fd < 0) return -1;
         Conn *nc = register_client_fd(fd, efd);
-
-        if (!nc) {
-            continue;
-        }
-
+        if (!nc) continue;
         handle_conn(nc, efd);
     }
 }
 
-/* Unix control listener --------------------------------------------------- */
-
 static void accept_control_loop(int ctrl_sfd, int efd) {
     for (;;) {
-        int fd=accept4(ctrl_sfd,NULL,NULL,SOCK_NONBLOCK|SOCK_CLOEXEC);
-        if (fd<0) {
+        int fd = accept4(ctrl_sfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (fd < 0) {
             if (errno==EAGAIN||errno==EWOULDBLOCK) return;
-            if (errno==EINTR) continue;
+            if (errno == EINTR) continue;
             return;
         }
-
-        CtrlConn *cc=ctrl_alloc();
-        if (!cc){close(fd);continue;}
-        cc->fd=fd;
-        struct epoll_event ev={
-            .events=EPOLLIN|EPOLLRDHUP|EPOLLET,
-            .data.ptr=cc
-        };
-        if (epoll_ctl(efd,EPOLL_CTL_ADD,fd,&ev)<0) {
-            ctrl_close(cc,efd);
-            continue;
-        }
+        CtrlConn *cc = ctrl_alloc();
+        if (!cc) { close(fd); continue; }
+        cc->fd = fd;
+        struct epoll_event ev = { .events = EPOLLIN | EPOLLRDHUP | EPOLLET, .data.ptr = cc };
+        if (epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ev) < 0) { ctrl_close(cc, efd); continue; }
     }
 }
 
 static int make_parent_dir(const char *path) {
     char tmp[256];
-    strncpy(tmp,path,sizeof(tmp)-1);
-    tmp[sizeof(tmp)-1]='\0';
-    char *sl=strrchr(tmp,'/');
-    if (sl&&sl!=tmp){*sl='\0';mkdir(tmp,0777);}
+    strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    char *sl = strrchr(tmp, '/');
+    if (sl && sl != tmp) { *sl = '\0'; mkdir(tmp, 0777); }
     return 0;
 }
 
 static int listen_unix_seqpacket(const char *path) {
     unlink(path);
     make_parent_dir(path);
-
-    int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_NONBLOCK|SOCK_CLOEXEC,0);
-    if (fd<0){perror("socket ctrl");return -1;}
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) { perror("socket ctrl"); return -1; }
 
     struct sockaddr_un addr;
-    memset(&addr,0,sizeof(addr));
-    addr.sun_family=AF_UNIX;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
     size_t plen = strlen(path);
     if (plen >= sizeof(addr.sun_path)) {
         fprintf(stderr, "control socket path too long: %s\n", path);
-        close(fd);
-        return -1;
+        close(fd); return -1;
     }
-    memcpy(addr.sun_path,path,plen+1);
+    memcpy(addr.sun_path, path, plen + 1);
 
-    if (bind(fd,(struct sockaddr*)&addr,sizeof(addr))<0){perror("bind ctrl");close(fd);return -1;}
-    chmod(path,0666);
-    if (listen(fd,64)<0){perror("listen ctrl");close(fd);return -1;}
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind ctrl"); close(fd); return -1; }
+    chmod(path, 0666);
+    if (listen(fd, 64) < 0) { perror("listen ctrl"); close(fd); return -1; }
     return fd;
 }
-
-/* Main event loop --------------------------------------------------------- */
 
 static void event_loop(int ctrl_sfd, int efd) {
     struct epoll_event evs[128];
     for (;;) {
-        int n=epoll_wait(efd,evs,128,-1);
-        if (n<0) {
-            if (errno==EINTR) continue;
-            return;
-        }
-        for (int i=0;i<n;i++) {
-            EventTag *tag=(EventTag*)evs[i].data.ptr;
+        int n = epoll_wait(efd, evs, 128, -1);
+        if (n < 0) { if (errno == EINTR) continue; return; }
+        for (int i = 0; i < n; i++) {
+            EventTag *tag = (EventTag *)evs[i].data.ptr;
             if (!tag) continue;
-
-            if (tag->kind==EV_CTRL_LISTENER) {
-                accept_control_loop(ctrl_sfd,efd);
+            if (tag->kind == EV_CTRL_LISTENER) { accept_control_loop(ctrl_sfd, efd); continue; }
+            if (tag->kind == EV_CTRL_CONN) {
+                CtrlConn *cc = (CtrlConn *)tag;
+                if (evs[i].events & EPOLLIN) {
+                    if (drain_control_fds(cc, efd) < 0) { ctrl_close(cc, efd); continue; }
+                }
+                if (evs[i].events & (EPOLLRDHUP|EPOLLHUP|EPOLLERR)) { ctrl_close(cc, efd); continue; }
                 continue;
             }
-
-            if (tag->kind==EV_CTRL_CONN) {
-                CtrlConn *cc=(CtrlConn*)tag;
-                if (evs[i].events&EPOLLIN) {
-                    if (drain_control_fds(cc,efd)<0){ctrl_close(cc,efd);continue;}
-                }
-                if (evs[i].events&(EPOLLRDHUP|EPOLLHUP|EPOLLERR)){
-                    ctrl_close(cc,efd);
-                    continue;
-                }
-                continue;
-            }
-
-            Conn *c=(Conn*)tag;
-            if (evs[i].events&(EPOLLRDHUP|EPOLLHUP|EPOLLERR)){conn_close(c,efd);continue;}
-            if (evs[i].events&EPOLLIN) handle_conn(c,efd);
+            Conn *c = (Conn *)tag;
+            if (evs[i].events & (EPOLLRDHUP|EPOLLHUP|EPOLLERR)) { conn_close(c, efd); continue; }
+            if (evs[i].events & EPOLLIN) handle_conn(c, efd);
         }
     }
 }
 
-#ifndef RINHA_API_NO_MAIN
+static void warm_up_index(void) {
+    const char *e = getenv("API_WARMUP_QUERIES");
+    int count = (e && *e) ? atoi(e) : 2048;
+    if (count <= 0) return;
+    uint8_t sink = 0;
+    for (int i = 0; i < count; i++) {
+        int16_t q[STORE_DIM];
+        for (int d = 0; d < STORE_DIM; d++) q[d] = 0;
+        for (int d = 0; d < DIMS; d++)
+            q[d] = (int16_t)(((size_t)i * 313 + (size_t)d * 1009) % (SCALE + 1));
+        if ((i & 3) == 0) { q[5] = -(int16_t)SCALE; q[6] = -(int16_t)SCALE; }
+        if (i & 1) q[9] = SCALE;
+        if (i & 2) q[10] = SCALE;
+        if (i & 4) q[11] = SCALE;
+        sink ^= fraud_count(q);
+    }
+    __asm__ volatile("" :: "r"(sink));
+}
 
-/* Runtime setup ----------------------------------------------------------- */
+#ifndef RINHA_API_NO_MAIN
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
-    for (int i=0;i<6;i++) RESP_FRAUD_LEN[i]=strlen(RESP_FRAUD[i]);
+    for (int i = 0; i < 6; i++) RESP_FRAUD_LEN[i] = strlen(RESP_FRAUD[i]);
 
-    const char *sock  = getenv("RINHA_SOCK");       if(!sock)  sock="/run/sock/api.sock";
-    const char *ipath = getenv("RINHA_INDEX_PATH"); if(!ipath) ipath="/app/data/index.ivf";
+    const char *sock  = getenv("RINHA_SOCK");       if (!sock)  sock = "/run/sock/api.sock";
+    const char *ipath = getenv("RINHA_INDEX_PATH"); if (!ipath) ipath = "/app/data/index.ivf";
 
     load_index(ipath);
-
-    {
-        float dq[DIMS]={0};
-        compute_centroid_dists(dq, g_ct, g_k, g_dists);
-        uint32_t s = 0x9E3779B9u;
-        for (int i=0;i<2000;i++) {
-            float q[DIMS];
-            for (int d=0;d<DIMS;d++) {
-                s = s*1664525u + 1013904223u;
-                q[d] = (float)(s & 0xFFFFu) * (1.0f/65535.0f);
-            }
-            knn5_search(q);
-        }
-    }
+    warm_up_index();
+    fprintf(stderr, "[api] índice carregado: %u pontos, %u partições\n",
+            g_n_points, g_part_count);
 
     char ctrl_sock[256];
     const char *ctrl_env = getenv("RINHA_CTRL_SOCK");
     if (ctrl_env && *ctrl_env) {
-        strncpy(ctrl_sock, ctrl_env, sizeof(ctrl_sock)-1);
-        ctrl_sock[sizeof(ctrl_sock)-1] = '\0';
+        strncpy(ctrl_sock, ctrl_env, sizeof(ctrl_sock) - 1);
+        ctrl_sock[sizeof(ctrl_sock) - 1] = '\0';
     } else {
         snprintf(ctrl_sock, sizeof(ctrl_sock), "%s.ctrl", sock);
     }
 
-    int ctrl_sfd=listen_unix_seqpacket(ctrl_sock);
-    if (ctrl_sfd<0)return 1;
+    int ctrl_sfd = listen_unix_seqpacket(ctrl_sock);
+    if (ctrl_sfd < 0) return 1;
 
-    int efd=epoll_create1(EPOLL_CLOEXEC);
-    if (efd<0){perror("epoll_create1");return 1;}
-    struct epoll_event ev={.events=EPOLLIN,.data.ptr=&ctrl_listener_tag};
-    epoll_ctl(efd,EPOLL_CTL_ADD,ctrl_sfd,&ev);
+    int efd = epoll_create1(EPOLL_CLOEXEC);
+    if (efd < 0) { perror("epoll_create1"); return 1; }
+    struct epoll_event ev = { .events = EPOLLIN, .data.ptr = &ctrl_listener_tag };
+    epoll_ctl(efd, EPOLL_CTL_ADD, ctrl_sfd, &ev);
 
     conn_pool_init();
     ctrl_pool_init();
-    event_loop(ctrl_sfd,efd);
+    event_loop(ctrl_sfd, efd);
     return 0;
 }
 #endif
